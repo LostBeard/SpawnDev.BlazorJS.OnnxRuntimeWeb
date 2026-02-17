@@ -28,15 +28,26 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         public static string LatestCDNVersionSrc { get; } = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/ort.webgpu.bundle.min.mjs";
 
         /// <summary>
-        /// Local static assets path prefix for WASM files bundled with this library.
-        /// Uses absolute path to prevent double-nesting when ORT resolves relative to its JS module location.
+        /// Local static assets content path suffix for WASM files bundled with this library.
+        /// Combined with the document base URI at runtime to produce the correct absolute URL.
         /// </summary>
-        public static string BundledWasmPrefix { get; } = "/_content/SpawnDev.BlazorJS.OnnxRuntimeWeb/";
+        public const string BundledWasmContentPath = "_content/SpawnDev.BlazorJS.OnnxRuntimeWeb/";
 
         private static BlazorJSRuntime JS => BlazorJSRuntime.JS;
 
         /// <inheritdoc/>
         public OnnxRuntime(IJSInProcessObjectReference _ref) : base(_ref) { }
+
+        /// <summary>
+        /// Gets the WASM path prefix by combining the document's base URI with the content path.
+        /// This ensures correct resolution regardless of deployment location (e.g., GitHub Pages subdirectory).
+        /// </summary>
+        private static string GetWasmPrefix()
+        {
+            var baseUri = JS.Get<string>("document.baseURI");
+            if (!baseUri.EndsWith("/")) baseUri += "/";
+            return baseUri + BundledWasmContentPath;
+        }
 
         /// <summary>
         /// Initialize the ONNX Runtime Web module.
@@ -51,10 +62,10 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
             if (ort == null)
                 throw new Exception("ONNX Runtime Web could not be initialized.");
 
-            // Configure WASM paths to the bundled local static assets
+            // Configure WASM paths using the base URI to support subdirectory deployments
             using var env = ort.Env;
             using var wasm = env.Wasm;
-            wasm.JSRef!.Set("wasmPaths", BundledWasmPrefix);
+            wasm.JSRef!.Set("wasmPaths", GetWasmPrefix());
 
             return ort;
         }
