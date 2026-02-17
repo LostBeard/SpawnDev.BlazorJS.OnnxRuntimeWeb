@@ -5,6 +5,12 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <OverrideHtmlAssetPlaceholders>true</OverrideHtmlAssetPlaceholders>
+	  <!-- Not needed -->
+	  <CompressionEnabled>false</CompressionEnabled>
+	  <!-- Disable IL trimming to preserve ILGPU kernel methods invoked via reflection -->
+	  <PublishTrimmed>false</PublishTrimmed>
+	  <!-- Disable AOT compilation - ILGPU needs IL reflection to work -->
+	  <RunAOTCompilation>false</RunAOTCompilation>
   </PropertyGroup>
 
   <ItemGroup>
