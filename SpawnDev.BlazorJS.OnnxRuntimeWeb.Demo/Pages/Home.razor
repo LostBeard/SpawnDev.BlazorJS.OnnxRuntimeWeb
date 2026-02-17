@@ -1,7 +1,131 @@
 ﻿@page "/"
 
-<PageTitle>Home</PageTitle>
+<PageTitle>SpawnDev.BlazorJS.OnnxRuntimeWeb</PageTitle>
 
-<h1>Hello, world!</h1>
+<div style="max-width: 900px;">
 
-Welcome to your new app.
+    <!-- Hero -->
+    <div style="padding: 2rem 0 1.5rem;">
+        <h1 style="font-size: 2rem; margin-bottom: 0.5rem;">
+            <span class="glow-text">SpawnDev.BlazorJS.OnnxRuntimeWeb</span>
+        </h1>
+        <p class="text-secondary" style="font-size: 1.1rem; line-height: 1.7; margin-bottom: 1.5rem;">
+            Strongly-typed C# wrappers for the
+            <a href="https://onnxruntime.ai/docs/api/js/" target="_blank">ONNX Runtime Web</a>
+            JavaScript API, built on
+            <a href="https://github.com/LostBeard/SpawnDev.BlazorJS" target="_blank">SpawnDev.BlazorJS</a>.
+            Run machine learning models directly in the browser via Blazor WebAssembly — no server required.
+        </p>
+
+        <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 2rem;">
+            <span class="badge accent">🧠 ONNX Runtime</span>
+            <span class="badge accent">🔥 Blazor WASM</span>
+            <span class="badge accent">⚡ WebGPU</span>
+            <span class="badge accent">🎯 Strongly Typed</span>
+        </div>
+    </div>
+
+    <!-- Feature Cards -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin-bottom: 2rem;">
+
+        <div class="card">
+            <div class="card-header">🎯 Full API Coverage</div>
+            <div class="card-description">
+                Wrappers for <code>Tensor</code>, <code>InferenceSession</code>,
+                <code>SessionOptions</code>, <code>RunOptions</code>, and <code>Environment</code>
+                — all with XML documentation and MDN links.
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">⚡ WebGPU Acceleration</div>
+            <div class="card-description">
+                Run inference on the GPU with WebGPU execution providers.
+                Supports <code>gpu-buffer</code> output location for zero-copy pipelines.
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">🔗 SpawnDev.BlazorJS</div>
+            <div class="card-description">
+                Built on the battle-tested <code>JSObject</code> interop layer.
+                No <code>IJSRuntime</code> — use real C# types for JS objects with
+                automatic resource management.
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Quick Start -->
+    <h2 style="margin-bottom: 0.75rem;">Quick Start</h2>
+
+    <pre><code>// Program.cs
+var builder = WebAssemblyHostBuilder.CreateDefault(args);
+builder.Services.AddBlazorJSRuntime();
+await builder.Build().BlazorJSRunAsync();
+
+// Load ORT and create a session
+var ort = await OnnxRuntime.Init();
+var session = await ort.CreateInferenceSessionAsync(modelBytes,
+    new SessionCreateOptions { ExecutionProviders = new[] { "wasm" } });
+
+// Create input tensor and run inference
+using var data = new Float32Array(new float[] { 1f, 2f, 3f });
+using var tensor = new OrtTensor("float32", data, new long[] { 1, 3 });
+using var feeds = new OrtFeeds();
+feeds.Set("input", tensor);
+
+using var result = await session.Run(feeds);
+using var output = result.GetTensor("output");</code></pre>
+
+    <!-- Demos -->
+    <h2 style="margin: 1.5rem 0 0.75rem;">Interactive Demos</h2>
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin-bottom: 2rem;">
+
+        <a href="mnist" style="text-decoration: none;">
+            <div class="card" style="cursor: pointer;">
+                <div class="card-header">✏️ MNIST Digit Recognition</div>
+                <div class="card-description">
+                    Draw a digit on a canvas and classify it in real-time using a tiny MNIST model (26KB).
+                </div>
+            </div>
+        </a>
+
+        <a href="image-classification" style="text-decoration: none;">
+            <div class="card" style="cursor: pointer;">
+                <div class="card-header">🖼️ Image Classification</div>
+                <div class="card-description">
+                    Upload an image and classify it using SqueezeNet. See top-5 predictions with confidence scores.
+                </div>
+            </div>
+        </a>
+
+        <a href="gpu-preprocessing" style="text-decoration: none;">
+            <div class="card" style="cursor: pointer;">
+                <div class="card-header">🚀 GPU Preprocessing</div>
+                <div class="card-description">
+                    Compare CPU vs GPU image preprocessing using SpawnDev.ILGPU WebGPU kernels before inference.
+                </div>
+            </div>
+        </a>
+
+    </div>
+
+    <!-- Links -->
+    <div style="display: flex; gap: 1rem; flex-wrap: wrap; padding-bottom: 2rem;">
+        <a href="https://www.nuget.org/packages/SpawnDev.BlazorJS.OnnxRuntimeWeb" target="_blank" class="btn-primary btn"
+           style="display: inline-flex; align-items: center; gap: 0.5rem;">
+            📦 NuGet Package
+        </a>
+        <a href="https://github.com/LostBeard/SpawnDev.BlazorJS.OnnxRuntimeWeb" target="_blank" class="btn-outline"
+           style="display: inline-flex; align-items: center; gap: 0.5rem;">
+            ⭐ GitHub Repository
+        </a>
+        <a href="tests" class="btn-outline"
+           style="display: inline-flex; align-items: center; gap: 0.5rem;">
+            🧪 Run Tests
+        </a>
+    </div>
+
+</div>

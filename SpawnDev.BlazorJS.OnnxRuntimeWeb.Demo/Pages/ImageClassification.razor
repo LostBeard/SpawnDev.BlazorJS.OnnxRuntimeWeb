@@ -1,0 +1,309 @@
+@page "/image-classification"
+@implements IDisposable
+@using System.Text.Json
+
+<PageTitle>Image Classification — SqueezeNet</PageTitle>
+
+<h1 style="margin-bottom: 0.25rem;">🖼️ Image Classification</h1>
+<p class="text-secondary" style="margin-bottom: 1.5rem;">Upload an image to classify it using <strong>SqueezeNet 1.0</strong> (5MB model, 1000 ImageNet classes).</p>
+
+<div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start;">
+
+    <!-- Image Area -->
+    <div style="min-width: 260px;">
+
+        <div style="position: relative; width: 260px; height: 260px; background: var(--bg-card); border: 1px solid var(--border-color);
+                    border-radius: var(--radius-lg); display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 0.75rem;">
+            @if (_imageDataUrl != null)
+            {
+                <img src="@_imageDataUrl" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+            }
+            else
+            {
+                <span class="text-muted" style="font-size: 0.9rem;">No image selected</span>
+            }
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem;">
+            <label class="btn btn-primary" style="cursor: pointer; margin: 0;">
+                Upload Image
+                <InputFile OnChange="OnFileSelected" accept="image/*" style="display: none;" />
+            </label>
+            <button class="btn-outline" @onclick="ClassifyImage" disabled="@(_loading || _imageDataUrl == null || _ort == null)">
+                @(_loading ? "Classifying..." : "Classify")
+            </button>
+        </div>
+
+        @if (_statusMessage != null)
+        {
+            <p class="text-secondary" style="font-size: 0.85rem;">@_statusMessage</p>
+        }
+
+        <!-- Sample Images -->
+        <div style="margin-top: 1rem;">
+            <p class="text-muted" style="font-size: 0.8rem; margin-bottom: 0.5rem;">Or try a sample:</p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                @foreach (var sample in _sampleImages)
+                {
+                    <button class="btn-outline" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;"
+                            @onclick="() => LoadSample(sample)">
+                        @sample.Name
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div style="min-width: 300px; flex: 1;">
+        @if (_predictions != null && _predictions.Length > 0)
+        {
+            <h3 style="margin-bottom: 0.75rem;">Top 5 Predictions</h3>
+            @for (int i = 0; i < _predictions.Length; i++)
+            {
+                var pred = _predictions[i];
+                var isTop = i == 0;
+                <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem;">
+                    <span style="font-size: 1.25rem; font-weight: 700; min-width: 2rem; text-align: center;
+                                 color: @(isTop ? "var(--accent)" : "var(--text-muted)");">
+                        #@(i + 1)
+                    </span>
+                    <div style="flex: 1;">
+                        <div style="font-size: 0.9rem; color: @(isTop ? "var(--text-primary)" : "var(--text-secondary)"); margin-bottom: 0.25rem;">
+                            @pred.ClassName
+                        </div>
+                        <div class="progress-bar-container" style="height: 8px;">
+                            <div class="progress-bar-fill" style="width: @($"{pred.Confidence:F1}")%;
+                                        @(isTop ? "background: linear-gradient(90deg, #2563eb, #7c3aed);" : "background: var(--border-color);")">
+                            </div>
+                        </div>
+                    </div>
+                    <span style="min-width: 55px; text-align: right; font-size: 0.85rem; font-family: monospace;
+                                 color: @(isTop ? "var(--accent)" : "var(--text-muted)");">
+                        @($"{pred.Confidence:F1}")%
+                    </span>
+                </div>
+            }
+
+            @if (_inferenceTimeMs > 0)
+            {
+                <p class="text-muted" style="margin-top: 1rem; font-size: 0.8rem;">
+                    Preprocessing: @($"{_preprocessTimeMs:F1}") ms | Inference: @($"{_inferenceTimeMs:F1}") ms
+                </p>
+            }
+        }
+        else if (_ort == null)
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Loading ONNX Runtime & SqueezeNet...</p>
+            </div>
+        }
+        else
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Upload an image to see predictions</p>
+            </div>
+        }
+    </div>
+
+</div>
+
+
+@code {
+    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+
+    record ClassPrediction(string ClassName, float Confidence);
+    record SampleImage(string Name, string Url);
+
+    private OnnxRuntime? _ort;
+    private OrtInferenceSession? _session;
+    private string? _imageDataUrl;
+    private string? _statusMessage;
+    private bool _loading;
+    private ClassPrediction[]? _predictions;
+    private double _inferenceTimeMs;
+    private double _preprocessTimeMs;
+
+    // Full ImageNet 1000-class labels loaded from JSON
+    private static string[]? _imagenetLabels;
+
+    private readonly SampleImage[] _sampleImages = new[]
+    {
+        new SampleImage("🐱 Cat", "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4d/Cat_November_2010-1a.jpg/220px-Cat_November_2010-1a.jpg"),
+        new SampleImage("🐕 Dog", "https://upload.wikimedia.org/wikipedia/commons/thumb/2/26/YellowLabradorLooking_new.jpg/220px-YellowLabradorLooking_new.jpg"),
+        new SampleImage("🚗 Car", "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a4/2019_Toyota_Corolla_Hybrid_1.8.jpg/220px-2019_Toyota_Corolla_Hybrid_1.8.jpg"),
+    };
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        _statusMessage = "Loading ONNX Runtime...";
+        StateHasChanged();
+
+        _ort = await OnnxRuntime.Init();
+
+        // Load ImageNet labels if not already cached
+        if (_imagenetLabels == null)
+        {
+            _statusMessage = "Loading ImageNet labels...";
+            StateHasChanged();
+            using var labelsResponse = await JS.Fetch("models/imagenet_labels.json");
+            var labelsJson = await labelsResponse.Text();
+            _imagenetLabels = JsonSerializer.Deserialize<string[]>(labelsJson) ?? new string[0];
+        }
+
+        _statusMessage = "Loading SqueezeNet model (5MB)...";
+        StateHasChanged();
+
+        using var response = await JS.Fetch("models/squeezenet/squeezenet1.0-12.onnx");
+        using var arrayBuffer = await response.ArrayBuffer();
+
+        _session = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions
+        {
+            LogSeverityLevel = 3
+        });
+
+        _statusMessage = $"Ready — Input: {_session.InputNames[0]}, Output: {_session.OutputNames[0]}";
+        StateHasChanged();
+    }
+
+    async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        // Read image as data URL
+        var buffer = new byte[file.Size];
+        await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).ReadExactlyAsync(buffer);
+        _imageDataUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(buffer)}";
+        _predictions = null;
+        StateHasChanged();
+
+        // Auto-classify
+        await ClassifyImage();
+    }
+
+    async Task LoadSample(SampleImage sample)
+    {
+        _loading = true;
+        _statusMessage = $"Loading {sample.Name}...";
+        _predictions = null;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            // Fetch image via JS to avoid CORS issues with C# HttpClient
+            using var response = await JS.Fetch(sample.Url);
+            using var blob = await response.Blob();
+            _imageDataUrl = URL.CreateObjectURL(blob);
+            StateHasChanged();
+            await ClassifyImage();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error loading sample: {ex.Message}";
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    async Task ClassifyImage()
+    {
+        if (_session == null || _imageDataUrl == null) return;
+        _loading = true;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            var swPreprocess = System.Diagnostics.Stopwatch.StartNew();
+
+            // Draw image to OffscreenCanvas at 224x224 (no DOM element needed)
+            using var canvas = new OffscreenCanvas(224, 224);
+            using var ctx = canvas.Get2DContext();
+            using var img = await HTMLImageElement.CreateFromImageAsync(_imageDataUrl);
+            ctx.DrawImage(img, 0, 0, 224, 224);
+
+            // Get pixel data
+            var rgbaBytes = ctx.GetImageBytes(0, 0, 224, 224);
+            if (rgbaBytes == null || rgbaBytes.Length == 0)
+            {
+                _statusMessage = "Error: Failed to read pixel data from canvas";
+                return;
+            }
+
+            // SqueezeNet expects NCHW [1,3,224,224] normalized with ImageNet mean/std
+            float[] mean = { 0.485f, 0.456f, 0.406f };
+            float[] std = { 0.229f, 0.224f, 0.225f };
+
+            var inputValues = new float[1 * 3 * 224 * 224];
+            int totalPixels = 224 * 224;
+            for (int i = 0; i < totalPixels; i++)
+            {
+                int pi = i * 4;
+                float r = rgbaBytes[pi] / 255f;
+                float g = rgbaBytes[pi + 1] / 255f;
+                float b = rgbaBytes[pi + 2] / 255f;
+                inputValues[0 * totalPixels + i] = (r - mean[0]) / std[0];
+                inputValues[1 * totalPixels + i] = (g - mean[1]) / std[1];
+                inputValues[2 * totalPixels + i] = (b - mean[2]) / std[2];
+            }
+
+            swPreprocess.Stop();
+            _preprocessTimeMs = swPreprocess.Elapsed.TotalMilliseconds;
+
+            var swInference = System.Diagnostics.Stopwatch.StartNew();
+
+            // Create tensor and run
+            using var floatData = new Float32Array(inputValues);
+            using var tensor = new OrtTensor("float32", floatData, new long[] { 1, 3, 224, 224 });
+
+            using var feeds = new OrtFeeds();
+            feeds.Set(_session.InputNames[0], tensor);
+
+            using var result = await _session.Run(feeds);
+            using var output = result.GetTensor(_session.OutputNames[0]);
+            using var outputData = output.GetData<Float32Array>();
+
+            // SqueezeNet 1.0 output "softmaxout_1" is already softmaxed —
+            // values are probabilities (0..1), NOT raw logits. No need for additional softmax.
+            var probs = outputData.ToArray();
+
+            // Top 5
+            _predictions = probs
+                .Select((p, i) => new ClassPrediction(GetClassName(i), p * 100f))
+                .OrderByDescending(p => p.Confidence)
+                .Take(5)
+                .ToArray();
+
+            swInference.Stop();
+            _inferenceTimeMs = swInference.Elapsed.TotalMilliseconds;
+            _statusMessage = null;
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error: {ex.Message}";
+            Console.WriteLine($"Classification Error: {ex}");
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    static string GetClassName(int idx)
+    {
+        if (_imagenetLabels != null && idx >= 0 && idx < _imagenetLabels.Length)
+            return _imagenetLabels[idx];
+        return $"class_{idx}";
+    }
+
+    public void Dispose()
+    {
+        _session?.Dispose();
+        _ort?.Dispose();
+    }
+}

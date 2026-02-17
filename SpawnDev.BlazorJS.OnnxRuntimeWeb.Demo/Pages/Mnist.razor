@@ -1,0 +1,287 @@
+@page "/mnist"
+@implements IDisposable
+
+<PageTitle>MNIST Digit Recognition</PageTitle>
+
+<h1 style="margin-bottom: 0.25rem;">✏️ MNIST Digit Recognition</h1>
+<p class="text-secondary" style="margin-bottom: 1.5rem;">Draw a digit (0-9) on the canvas below and click <strong>Classify</strong> to run inference.</p>
+
+<div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start;">
+
+    <!-- Canvas Area -->
+    <div>
+        <canvas @ref="_canvasRef"
+                width="280" height="280"
+                style="background: #000; cursor: crosshair; touch-action: none;"
+                @onmousedown="OnMouseDown"
+                @onmousemove="OnMouseMove"
+                @onmouseup="OnMouseUp"
+                @onmouseleave="OnMouseUp"
+                @ontouchstart="OnTouchStart"
+                @ontouchstart:preventDefault
+                @ontouchmove="OnTouchMove"
+                @ontouchmove:preventDefault
+                @ontouchend="OnTouchEnd" />
+
+        <div style="display: flex; gap: 0.5rem; margin-top: 0.75rem;">
+            <button class="btn btn-primary" @onclick="Classify" disabled="@(_loading || _ort == null)">
+                @(_loading ? "Running..." : "Classify")
+            </button>
+            <button class="btn-outline" @onclick="ClearCanvas">Clear</button>
+        </div>
+
+        @if (_statusMessage != null)
+        {
+            <p class="text-secondary" style="margin-top: 0.5rem; font-size: 0.85rem;">@_statusMessage</p>
+        }
+    </div>
+
+    <!-- Results -->
+    <div style="min-width: 280px; flex: 1;">
+        @if (_predictions != null && _predictions.Length > 0)
+        {
+            <h3 style="margin-bottom: 0.75rem;">Predictions</h3>
+            @foreach (var pred in _predictions)
+            {
+                <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
+                    <span style="font-size: 1.5rem; font-weight: 700; min-width: 2rem; text-align: center;
+                                 color: @(pred == _predictions[0] ? "var(--accent)" : "var(--text-secondary)");">
+                        @pred.Digit
+                    </span>
+                    <div style="flex: 1;">
+                        <div class="progress-bar-container" style="height: 8px;">
+                            <div class="progress-bar-fill" style="width: @($"{pred.Confidence:F1}")%;
+                                        @(pred == _predictions[0] ? "background: linear-gradient(90deg, #2563eb, #7c3aed);" : "background: var(--border-color);")">
+                            </div>
+                        </div>
+                    </div>
+                    <span style="min-width: 50px; text-align: right; font-size: 0.85rem; font-family: monospace;
+                                 color: @(pred == _predictions[0] ? "var(--accent)" : "var(--text-muted)");">
+                        @($"{pred.Confidence:F1}")%
+                    </span>
+                </div>
+            }
+
+            @if (_inferenceTimeMs > 0)
+            {
+                <p class="text-muted" style="margin-top: 1rem; font-size: 0.8rem;">
+                    Inference: @($"{_inferenceTimeMs:F1}") ms
+                </p>
+            }
+        }
+        else if (_ort == null)
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Loading ONNX Runtime...</p>
+            </div>
+        }
+        else
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Draw a digit and click Classify</p>
+            </div>
+        }
+    </div>
+
+</div>
+
+@code {
+    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+
+    record Prediction(int Digit, float Confidence);
+
+    private ElementReference _canvasRef;
+    private CanvasRenderingContext2D? _ctx;
+    private OnnxRuntime? _ort;
+    private OrtInferenceSession? _session;
+    private bool _drawing;
+    private bool _loading;
+    private string? _statusMessage;
+    private Prediction[]? _predictions;
+    private double _inferenceTimeMs;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        // Get canvas context
+        using var canvas = new HTMLCanvasElement(_canvasRef);
+        _ctx = canvas.GetContext<CanvasRenderingContext2D>("2d");
+
+        SetupCanvas();
+
+        // Load ORT + MNIST model
+        _statusMessage = "Loading ONNX Runtime...";
+        StateHasChanged();
+
+        _ort = await OnnxRuntime.Init();
+
+        _statusMessage = "Loading MNIST model...";
+        StateHasChanged();
+
+        // Fetch model
+        using var response = await JS.Fetch("models/mnist/mnist-12.onnx");
+        using var arrayBuffer = await response.ArrayBuffer();
+
+        _session = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions
+        {
+            LogSeverityLevel = 3
+        });
+
+        _statusMessage = $"Ready — Inputs: [{string.Join(", ", _session.InputNames)}]";
+        StateHasChanged();
+    }
+
+    void SetupCanvas()
+    {
+        _ctx!.FillStyle = "#000000";
+        _ctx.FillRect(0, 0, 280, 280);
+        _ctx.StrokeStyle = "#ffffff";
+        _ctx.LineWidth = 16;
+        _ctx.LineCap = "round";
+        _ctx.LineJoin = "round";
+    }
+
+    void OnMouseDown(MouseEventArgs e)
+    {
+        _drawing = true;
+        _ctx!.BeginPath();
+        _ctx.MoveTo(e.OffsetX, e.OffsetY);
+    }
+
+    void OnMouseMove(MouseEventArgs e)
+    {
+        if (!_drawing) return;
+        _ctx!.LineTo(e.OffsetX, e.OffsetY);
+        _ctx.Stroke();
+    }
+
+    void OnMouseUp(MouseEventArgs e) => _drawing = false;
+
+    void OnTouchStart(TouchEventArgs e)
+    {
+        if (e.Touches.Length == 0) return;
+        _drawing = true;
+        // Touch coordinates need offset calculation via JS
+        var touch = e.Touches[0];
+        using var canvas = new HTMLCanvasElement(_canvasRef);
+        using var rect = canvas.GetBoundingClientRect();
+        var x = touch.ClientX - rect.Left;
+        var y = touch.ClientY - rect.Top;
+        _ctx!.BeginPath();
+        _ctx.MoveTo(x, y);
+    }
+
+    void OnTouchMove(TouchEventArgs e)
+    {
+        if (!_drawing || e.Touches.Length == 0) return;
+        var touch = e.Touches[0];
+        using var canvas = new HTMLCanvasElement(_canvasRef);
+        using var rect = canvas.GetBoundingClientRect();
+        var x = touch.ClientX - rect.Left;
+        var y = touch.ClientY - rect.Top;
+        _ctx!.LineTo(x, y);
+        _ctx.Stroke();
+    }
+
+    void OnTouchEnd(TouchEventArgs e) => _drawing = false;
+
+    void ClearCanvas()
+    {
+        SetupCanvas();
+        _predictions = null;
+        _inferenceTimeMs = 0;
+        StateHasChanged();
+    }
+
+    async Task Classify()
+    {
+        if (_session == null || _ctx == null) return;
+        _loading = true;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // Use OffscreenCanvas for 28x28 downscale (no DOM element needed)
+            using var resizeCanvas = new OffscreenCanvas(28, 28);
+            using var resizeCtx = resizeCanvas.Get2DContext();
+
+            // Enable high-quality smoothing
+            resizeCtx.JSRef!.Set("imageSmoothingEnabled", true);
+            resizeCtx.JSRef!.Set("imageSmoothingQuality", "high");
+
+            // Draw the 280x280 drawing canvas onto the 28x28 canvas (browser does bilinear resize)
+            using var drawCanvas = new HTMLCanvasElement(_canvasRef);
+            resizeCtx.DrawImage(drawCanvas, 0, 0, 28, 28);
+
+            // Read the 28x28 pixel data
+            using var imageData = resizeCtx.GetImageData(0, 0, 28, 28);
+            using var rgba = imageData.Data;
+
+            // Convert to grayscale float [1,1,28,28]
+            // MNIST is white digit on black background, canvas is white stroke on black fill
+            var inputData = new float[1 * 1 * 28 * 28];
+            for (int y = 0; y < 28; y++)
+            {
+                for (int x = 0; x < 28; x++)
+                {
+                    int idx = (y * 28 + x) * 4;
+                    // Use R channel (white on black → 0-255 grayscale)
+                    inputData[y * 28 + x] = rgba[(uint)idx] / 255f;
+                }
+            }
+
+            // Create tensor
+            using var floatData = new Float32Array(inputData);
+            using var tensor = new OrtTensor("float32", floatData, new long[] { 1, 1, 28, 28 });
+
+            // Run inference
+            using var feeds = new OrtFeeds();
+            feeds.Set(_session.InputNames[0], tensor);
+            using var result = await _session.Run(feeds);
+            using var output = result.GetTensor(_session.OutputNames[0]);
+
+            // Get output — softmax to convert logits to probabilities
+            using var outputData = output.GetData<Float32Array>();
+            var logits = new float[10];
+            for (int i = 0; i < 10; i++)
+                logits[i] = outputData[i];
+
+            // Softmax
+            float maxLogit = logits.Max();
+            var exps = logits.Select(l => (float)Math.Exp(l - maxLogit)).ToArray();
+            float sumExp = exps.Sum();
+            var probs = exps.Select(e => e / sumExp * 100f).ToArray();
+
+            // Top predictions
+            _predictions = probs
+                .Select((p, i) => new Prediction(i, p))
+                .OrderByDescending(p => p.Confidence)
+                .Take(5)
+                .ToArray();
+
+            sw.Stop();
+            _inferenceTimeMs = sw.Elapsed.TotalMilliseconds;
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error: {ex.Message}";
+            Console.WriteLine($"MNIST Error: {ex}");
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    public void Dispose()
+    {
+        _ctx?.Dispose();
+        _session?.Dispose();
+        _ort?.Dispose();
+    }
+}

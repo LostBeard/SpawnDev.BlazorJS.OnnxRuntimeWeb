@@ -1,0 +1,378 @@
+@page "/gpu-preprocessing"
+@using global::ILGPU
+@using global::ILGPU.Runtime
+@using SpawnDev.ILGPU
+@using SpawnDev.ILGPU.WebGPU
+@using System.Text.Json
+@implements IAsyncDisposable
+
+<PageTitle>GPU Preprocessing — ILGPU + ORT</PageTitle>
+
+<h1 style="margin-bottom: 0.25rem;">🚀 GPU Image Preprocessing</h1>
+<p class="text-secondary" style="margin-bottom: 1.5rem;">
+    Compare <strong>CPU</strong> vs <strong>GPU (ILGPU WebGPU)</strong> image preprocessing for ONNX inference.
+    Upload an image to normalize and transpose it for SqueezeNet (NCHW format, ImageNet normalization).
+</p>
+
+<div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start;">
+
+    <!-- Controls -->
+    <div style="min-width: 280px;">
+
+        <div style="position: relative; width: 260px; height: 260px; background: var(--bg-card); border: 1px solid var(--border-color);
+                    border-radius: var(--radius-lg); display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 0.75rem;">
+            @if (_imageDataUrl != null)
+            {
+                <img src="@_imageDataUrl" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+            }
+            else
+            {
+                <span class="text-muted" style="font-size: 0.9rem;">No image selected</span>
+            }
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem;">
+            <label class="btn btn-primary" style="cursor: pointer; margin: 0;">
+                Upload Image
+                <InputFile OnChange="OnFileSelected" accept="image/*" style="display: none;" />
+            </label>
+            <button class="btn-outline" @onclick="RunBenchmark" disabled="@(_loading || _imageDataUrl == null || !_ready)">
+                @(_loading ? "Running..." : "Run Benchmark")
+            </button>
+        </div>
+
+        @if (_statusMessage != null)
+        {
+            <p class="text-secondary" style="font-size: 0.85rem;">@_statusMessage</p>
+        }
+    </div>
+
+    <!-- Results -->
+    <div style="min-width: 350px; flex: 1;">
+
+        @if (_results != null)
+        {
+            <h3 style="margin-bottom: 0.75rem;">Benchmark Results</h3>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem;">
+                <div class="card">
+                    <div class="card-header" style="font-size: 0.9rem;">🖥️ CPU Preprocessing</div>
+                    <div style="font-size: 2rem; font-weight: 700; color: var(--text-primary);">
+                        @($"{_results.CpuPreprocessMs:F1}") <span style="font-size: 0.9rem; color: var(--text-muted);">ms</span>
+                    </div>
+                    <div class="text-muted" style="font-size: 0.8rem; margin-top: 0.25rem;">
+                        Inference: @($"{_results.CpuInferenceMs:F1}") ms
+                    </div>
+                </div>
+                <div class="card" style="border-color: rgba(88,166,255,0.3);">
+                    <div class="card-header" style="font-size: 0.9rem;">⚡ GPU Preprocessing</div>
+                    <div style="font-size: 2rem; font-weight: 700; color: var(--accent);">
+                        @($"{_results.GpuPreprocessMs:F1}") <span style="font-size: 0.9rem; color: var(--text-muted);">ms</span>
+                    </div>
+                    <div class="text-muted" style="font-size: 0.8rem; margin-top: 0.25rem;">
+                        Inference: @($"{_results.GpuInferenceMs:F1}") ms
+                    </div>
+                </div>
+            </div>
+
+            @if (_results.Speedup > 0)
+            {
+                <div class="card" style="margin-bottom: 1rem;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span class="text-secondary">Preprocessing Speedup</span>
+                        <span style="font-size: 1.25rem; font-weight: 700; color: @(_results.Speedup >= 1 ? "var(--success)" : "var(--warning)");">
+                            @($"{_results.Speedup:F1}")×
+                        </span>
+                    </div>
+                </div>
+            }
+
+            <h4 style="margin-bottom: 0.5rem;">Result Verification</h4>
+            <p style="font-size: 0.85rem; color: @(_results.ResultsMatch ? "var(--success)" : "var(--danger)");">
+                @(_results.ResultsMatch ? "✅ CPU and GPU inference results match!" : "❌ Results differ — check implementation")
+            </p>
+
+            @if (_results.CpuTopClass != null)
+            {
+                <div style="margin-top: 0.5rem; font-size: 0.85rem;">
+                    <p><span class="text-muted">CPU Top Class:</span> <strong>@_results.CpuTopClass</strong> (@($"{_results.CpuTopConfidence:F1}")%)</p>
+                    <p><span class="text-muted">GPU Top Class:</span> <strong>@_results.GpuTopClass</strong> (@($"{_results.GpuTopConfidence:F1}")%)</p>
+                </div>
+            }
+        }
+        else if (!_ready)
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">@(_statusMessage ?? "Initializing...")</p>
+            </div>
+        }
+        else
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Upload an image and click Run Benchmark</p>
+            </div>
+        }
+    </div>
+
+</div>
+
+
+@code {
+    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+
+    record BenchmarkResult(
+        double CpuPreprocessMs, double CpuInferenceMs,
+        double GpuPreprocessMs, double GpuInferenceMs,
+        double Speedup, bool ResultsMatch,
+        string? CpuTopClass, float CpuTopConfidence,
+        string? GpuTopClass, float GpuTopConfidence);
+
+    private OnnxRuntime? _ort;
+    private OrtInferenceSession? _session;
+    private Context? _ilgpuContext;
+    private Accelerator? _accelerator;
+    private string? _imageDataUrl;
+    private string? _statusMessage;
+    private bool _loading;
+    private bool _ready;
+    private BenchmarkResult? _results;
+
+    // Full ImageNet 1000-class labels loaded from JSON
+    private static string[]? _imagenetLabels;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        try
+        {
+            // Init ORT
+            _statusMessage = "Loading ONNX Runtime...";
+            StateHasChanged();
+            _ort = await OnnxRuntime.Init();
+
+            // Load ImageNet labels if not already cached
+            if (_imagenetLabels == null)
+            {
+                _statusMessage = "Loading ImageNet labels...";
+                StateHasChanged();
+                using var labelsResponse = await JS.Fetch("models/imagenet_labels.json");
+                var labelsJson = await labelsResponse.Text();
+                _imagenetLabels = JsonSerializer.Deserialize<string[]>(labelsJson) ?? new string[0];
+            }
+
+            // Load model
+            _statusMessage = "Loading SqueezeNet model...";
+            StateHasChanged();
+            using var response = await JS.Fetch("models/squeezenet/squeezenet1.0-12.onnx");
+            using var arrayBuffer = await response.ArrayBuffer();
+            _session = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions { LogSeverityLevel = 3 });
+
+            // Init ILGPU WebGPU
+            _statusMessage = "Initializing ILGPU WebGPU...";
+            StateHasChanged();
+
+            _ilgpuContext = await Context.CreateAsync(b => b.WebGPU());
+            _accelerator = await _ilgpuContext.CreatePreferredAcceleratorAsync();
+
+            _statusMessage = $"Ready — ILGPU: {_accelerator.AcceleratorType}, {_accelerator.Name}";
+            _ready = true;
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Init error: {ex.Message}";
+            Console.WriteLine($"GPU Init Error: {ex}");
+        }
+
+        StateHasChanged();
+    }
+
+    async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        var buffer = new byte[file.Size];
+        await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).ReadExactlyAsync(buffer);
+        _imageDataUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(buffer)}";
+        _results = null;
+        StateHasChanged();
+    }
+
+    // ─── ILGPU Kernel: Normalize + NHWC→NCHW transpose ───
+    // Uses float input (not byte) because WebGPU WGSL doesn't support array<u8> in storage buffers.
+    // RGBA values are pre-converted to 0-255 floats on CPU before upload.
+    static void NormalizeTransposeKernel(
+        Index1D index,
+        ArrayView<float> rgbaFloats,
+        ArrayView<float> output,
+        int width,
+        int height)
+    {
+        int totalPixels = width * height;
+        if (index >= totalPixels) return;
+
+        int pixelIdx = index * 4;
+        float r = rgbaFloats[pixelIdx] / 255f;
+        float g = rgbaFloats[pixelIdx + 1] / 255f;
+        float b = rgbaFloats[pixelIdx + 2] / 255f;
+
+        // Normalize with ImageNet mean/std and write in NCHW order
+        output[0 * totalPixels + index] = (r - 0.485f) / 0.229f; // R channel
+        output[1 * totalPixels + index] = (g - 0.456f) / 0.224f; // G channel
+        output[2 * totalPixels + index] = (b - 0.406f) / 0.225f; // B channel
+    }
+
+    async Task RunBenchmark()
+    {
+        if (_session == null || _accelerator == null || _imageDataUrl == null) return;
+        _loading = true;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            // Get pixel data from image using OffscreenCanvas (no DOM element needed)
+            using var canvas = new OffscreenCanvas(224, 224);
+            using var ctx = canvas.Get2DContext();
+
+            using var img = await HTMLImageElement.CreateFromImageAsync(_imageDataUrl);
+
+            ctx.DrawImage(img, 0, 0, 224, 224);
+            using var imageData = ctx.GetImageData(0, 0, 224, 224);
+            using var rgbaData = imageData.Data;
+
+            // Bulk read all RGBA bytes at once instead of per-pixel indexing
+            var rgbaBytes = rgbaData.ReadBytes();
+
+            // ─── CPU Preprocessing ───
+            var swCpu = System.Diagnostics.Stopwatch.StartNew();
+            var cpuOutput = CpuPreprocess(rgbaBytes, 224, 224);
+            swCpu.Stop();
+            var cpuPreprocessMs = swCpu.Elapsed.TotalMilliseconds;
+
+            // ─── GPU Preprocessing ───
+            var swGpu = System.Diagnostics.Stopwatch.StartNew();
+            var gpuOutput = await GpuPreprocess(rgbaBytes, 224, 224);
+            swGpu.Stop();
+            var gpuPreprocessMs = swGpu.Elapsed.TotalMilliseconds;
+
+            // ─── CPU Inference ───
+            var swCpuInfer = System.Diagnostics.Stopwatch.StartNew();
+            var cpuPredictions = await RunInference(cpuOutput);
+            swCpuInfer.Stop();
+            var cpuInferenceMs = swCpuInfer.Elapsed.TotalMilliseconds;
+
+            // ─── GPU-preprocessed Inference ───
+            var swGpuInfer = System.Diagnostics.Stopwatch.StartNew();
+            var gpuPredictions = await RunInference(gpuOutput);
+            swGpuInfer.Stop();
+            var gpuInferenceMs = swGpuInfer.Elapsed.TotalMilliseconds;
+
+            // Verify results match
+            bool match = cpuPredictions.topIdx == gpuPredictions.topIdx;
+            double speedup = cpuPreprocessMs > 0 ? cpuPreprocessMs / gpuPreprocessMs : 0;
+
+            _results = new BenchmarkResult(
+                cpuPreprocessMs, cpuInferenceMs,
+                gpuPreprocessMs, gpuInferenceMs,
+                speedup, match,
+                GetClassName(cpuPredictions.topIdx), cpuPredictions.topConf,
+                GetClassName(gpuPredictions.topIdx), gpuPredictions.topConf);
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error: {ex.Message}";
+            Console.WriteLine($"Benchmark Error: {ex}");
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    float[] CpuPreprocess(byte[] rgba, int width, int height)
+    {
+        float[] meanR = { 0.485f }, meanG = { 0.456f }, meanB = { 0.406f };
+        float[] stdR = { 0.229f }, stdG = { 0.224f }, stdB = { 0.225f };
+
+        var output = new float[3 * width * height];
+        int totalPixels = width * height;
+
+        for (int i = 0; i < totalPixels; i++)
+        {
+            int pi = i * 4;
+            output[0 * totalPixels + i] = (rgba[pi] / 255f - meanR[0]) / stdR[0];
+            output[1 * totalPixels + i] = (rgba[pi + 1] / 255f - meanG[0]) / stdG[0];
+            output[2 * totalPixels + i] = (rgba[pi + 2] / 255f - meanB[0]) / stdB[0];
+        }
+        return output;
+    }
+
+    async Task<float[]> GpuPreprocess(byte[] rgba, int width, int height)
+    {
+        int totalPixels = width * height;
+
+        // Convert bytes to floats on CPU first — WebGPU WGSL doesn't support array<u8>
+        // in storage buffers (bytes get packed into 32-bit ints, corrupting individual reads)
+        var rgbaFloats = new float[rgba.Length];
+        for (int i = 0; i < rgba.Length; i++)
+            rgbaFloats[i] = rgba[i];
+
+        // Upload float RGBA to GPU
+        using var gpuInput = _accelerator!.Allocate1D(rgbaFloats);
+
+        // Output buffer (NCHW)
+        var emptyOutput = new float[3 * totalPixels];
+        using var gpuOutput = _accelerator.Allocate1D(emptyOutput);
+
+        // Load and run kernel
+        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, int, int>(NormalizeTransposeKernel);
+        kernel((Index1D)totalPixels, gpuInput.View, gpuOutput.View, width, height);
+        await _accelerator.SynchronizeAsync();
+
+        // Read back
+        var result = await gpuOutput.CopyToHostAsync<float>();
+        return result;
+    }
+
+    async Task<(int topIdx, float topConf)> RunInference(float[] preprocessed)
+    {
+        using var floatData = new Float32Array(preprocessed);
+        using var tensor = new OrtTensor("float32", floatData, new long[] { 1, 3, 224, 224 });
+        using var feeds = new OrtFeeds();
+        feeds.Set(_session!.InputNames[0], tensor);
+        using var result = await _session.Run(feeds);
+        using var output = result.GetTensor(_session.OutputNames[0]);
+        using var outputData = output.GetData<Float32Array>();
+
+        // SqueezeNet 1.0 output "softmaxout_1" is already softmaxed —
+        // values are probabilities (0..1), NOT raw logits. No need for additional softmax.
+        var probs = outputData.ToArray();
+
+        int topIdx = 0;
+        float topVal = 0;
+        for (int i = 0; i < probs.Length; i++)
+        {
+            float p = probs[i] * 100f;
+            if (p > topVal) { topVal = p; topIdx = i; }
+        }
+        return (topIdx, topVal);
+    }
+
+    static string GetClassName(int idx)
+    {
+        if (_imagenetLabels != null && idx >= 0 && idx < _imagenetLabels.Length)
+            return _imagenetLabels[idx];
+        return $"class_{idx}";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _session?.Dispose();
+        _ort?.Dispose();
+        _accelerator?.Dispose();
+        _ilgpuContext?.Dispose();
+    }
+}
