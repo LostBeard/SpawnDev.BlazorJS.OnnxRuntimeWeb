@@ -46,7 +46,6 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// <returns>The loaded OnnxRuntime module.</returns>
         public static async Task<OnnxRuntime> Init(string? srcUrl = null)
         {
-            Console.WriteLine(">> OnnxRuntime.Init");
             srcUrl ??= LatestBundledVersionSrc;
             var ort = await JS.Import<OnnxRuntime>(GlobalModuleName, srcUrl);
             if (ort == null)
@@ -57,7 +56,6 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
             using var wasm = env.Wasm;
             wasm.JSRef!.Set("wasmPaths", BundledWasmPrefix);
 
-            Console.WriteLine("<< OnnxRuntime.Init");
             return ort;
         }
 

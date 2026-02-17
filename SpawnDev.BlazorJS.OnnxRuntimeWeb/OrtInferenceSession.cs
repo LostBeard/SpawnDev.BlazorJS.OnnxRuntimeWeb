@@ -48,5 +48,29 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/InferenceSession-1.html#release"/>
         /// </summary>
         public Task Release() => JSRef!.CallVoidAsync("release");
+
+        /// <summary>
+        /// Get input metadata of the loaded model.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/InferenceSession-1.html#inputMetadata"/>
+        /// </summary>
+        public JSObject InputMetadata => JSRef!.Get<JSObject>("inputMetadata");
+
+        /// <summary>
+        /// Get output metadata of the loaded model.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/InferenceSession-1.html#outputMetadata"/>
+        /// </summary>
+        public JSObject OutputMetadata => JSRef!.Get<JSObject>("outputMetadata");
+
+        /// <summary>
+        /// Start profiling.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/InferenceSession-1.html#startProfiling"/>
+        /// </summary>
+        public void StartProfiling() => JSRef!.CallVoid("startProfiling");
+
+        /// <summary>
+        /// End profiling.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/InferenceSession-1.html#endProfiling"/>
+        /// </summary>
+        public void EndProfiling() => JSRef!.CallVoid("endProfiling");
     }
 }

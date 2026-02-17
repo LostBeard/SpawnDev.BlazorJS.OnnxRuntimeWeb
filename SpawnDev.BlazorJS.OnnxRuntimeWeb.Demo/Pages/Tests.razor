@@ -57,12 +57,20 @@
         _running = true;
         _tests.Clear();
 
-        // Define tests
-        var t1 = AddTest("1. Module Load");
-        var t2 = AddTest("2. Environment Configuration");
-        var t3 = AddTest("3. Session Create (simple add model)");
-        var t4 = AddTest("4. Tensor Create + Inference");
-        var t5 = AddTest("5. Output Verification");
+        // Define all tests
+        var t1  = AddTest("1. Module Load");
+        var t2  = AddTest("2. Environment Configuration");
+        var t3  = AddTest("3. Session Create (simple add model)");
+        var t4  = AddTest("4. Tensor Create + Inference");
+        var t5  = AddTest("5. Output Verification");
+        var t6  = AddTest("6. Tensor Properties");
+        var t7  = AddTest("7. Tensor Data Access");
+        var t8  = AddTest("8. Tensor Reshape");
+        var t9  = AddTest("9. Tensor Dispose");
+        var t10 = AddTest("10. Session Metadata");
+        var t11 = AddTest("11. Run with Options");
+        var t12 = AddTest("12. Multiple Inferences");
+        var t13 = AddTest("13. Int32 Tensor");
 
         StateHasChanged();
         await Task.Delay(50);
@@ -88,13 +96,9 @@
         });
 
         // ── Test 3: Create session from a tiny ONNX model ──
-        // We'll create a simple model inline — an Add model with 2 float inputs
-        // Using ORT's public test model: a small model that adds two tensors
         OrtInferenceSession? session = null;
         await RunTest(t3, async () =>
         {
-            // Create a simple "add" model using ONNX format
-            // Using a minimal ONNX protobuf for an Add(A, B) -> C model
             var modelBytes = BuildSimpleAddModel();
             using var jsArrayBuffer = new ArrayBuffer(modelBytes.Length);
             using var jsView = new Uint8Array(jsArrayBuffer);
@@ -120,24 +124,19 @@
         OrtSessionResult? result = null;
         await RunTest(t4, async () =>
         {
-            // Create two input tensors: A = [1, 2, 3], B = [4, 5, 6]
-            // Expected output C = [5, 7, 9]
             using var dataA = new Float32Array(new float[] { 1f, 2f, 3f });
             using var dataB = new Float32Array(new float[] { 4f, 5f, 6f });
 
-            // Create ORT tensors using the OrtTensor constructor
             using var tensorA = new OrtTensor("float32", dataA, new long[] { 1, 3 });
             using var tensorB = new OrtTensor("float32", dataB, new long[] { 1, 3 });
 
             t4.Detail = $"Input A dims: [{string.Join(",", tensorA.Dims)}], type: {tensorA.Type}";
 
-            // Build feeds using strongly-typed OrtFeeds
             using var feeds = new OrtFeeds();
             var inputNames = session!.InputNames;
             feeds.Set(inputNames[0], tensorA);
             feeds.Set(inputNames[1], tensorB);
 
-            // Run inference
             result = await session.Run(feeds, new SessionRunOptions { LogSeverityLevel = 2 });
             t4.Detail += $" → Output received";
         });
@@ -156,13 +155,11 @@
 
             t5.Detail = $"Dims: [{string.Join(",", dims)}], Type: {type}, Location: {location}";
 
-            // Read output data
             using var outputData = outputTensor.GetData<Float32Array>();
             var values = new float[outputData.Length];
             for (int i = 0; i < outputData.Length; i++)
                 values[i] = outputData[i];
 
-            // Verify: 1+4=5, 2+5=7, 3+6=9
             float[] expected = { 5f, 7f, 9f };
             for (int i = 0; i < expected.Length; i++)
             {
@@ -171,12 +168,223 @@
             }
 
             t5.Detail += $" → Values: [{string.Join(", ", values)}] ✓";
-
             await Task.CompletedTask;
         });
 
-        // Cleanup
+        // Cleanup result from test 4-5
         result?.Dispose();
+
+        // ── Test 6: Tensor Properties ──
+        await RunTest(t6, async () =>
+        {
+            using var data = new Float32Array(new float[] { 10f, 20f, 30f, 40f, 50f, 60f });
+            using var tensor = new OrtTensor("float32", data, new long[] { 2, 3 });
+
+            var dims = tensor.Dims;
+            var type = tensor.Type;
+            var size = tensor.Size;
+            var location = tensor.Location;
+
+            if (dims.Length != 2) throw new Exception($"Expected 2 dims, got {dims.Length}");
+            if (dims[0] != 2 || dims[1] != 3) throw new Exception($"Expected dims [2,3], got [{string.Join(",", dims)}]");
+            if (type != "float32") throw new Exception($"Expected type float32, got {type}");
+            if (size != 6) throw new Exception($"Expected size 6, got {size}");
+            if (location != "cpu") throw new Exception($"Expected location cpu, got {location}");
+
+            t6.Detail = $"Dims: [{string.Join(",", dims)}], Type: {type}, Size: {size}, Location: {location} ✓";
+            await Task.CompletedTask;
+        });
+
+        // ── Test 7: Tensor Data Access ──
+        await RunTest(t7, async () =>
+        {
+            var srcValues = new float[] { 1.5f, 2.5f, 3.5f };
+            using var data = new Float32Array(srcValues);
+            using var tensor = new OrtTensor("float32", data, new long[] { 3 });
+
+            // Synchronous data access (CPU tensor)
+            using var readBack = tensor.GetData<Float32Array>();
+            for (int i = 0; i < srcValues.Length; i++)
+            {
+                if (Math.Abs(readBack[i] - srcValues[i]) > 0.001f)
+                    throw new Exception($"Sync data[{i}] expected {srcValues[i]}, got {readBack[i]}");
+            }
+
+            // Async data access
+            using var asyncData = await tensor.GetDataAsync<Float32Array>();
+            for (int i = 0; i < srcValues.Length; i++)
+            {
+                if (Math.Abs(asyncData[i] - srcValues[i]) > 0.001f)
+                    throw new Exception($"Async data[{i}] expected {srcValues[i]}, got {asyncData[i]}");
+            }
+
+            t7.Detail = $"Sync read: [{string.Join(", ", srcValues)}], Async read: OK ✓";
+        });
+
+        // ── Test 8: Tensor Reshape ──
+        await RunTest(t8, async () =>
+        {
+            using var data = new Float32Array(new float[] { 1f, 2f, 3f, 4f, 5f, 6f });
+            using var tensor = new OrtTensor("float32", data, new long[] { 2, 3 });
+
+            using var reshaped = tensor.Reshape(new long[] { 3, 2 });
+
+            var newDims = reshaped.Dims;
+            if (newDims[0] != 3 || newDims[1] != 2)
+                throw new Exception($"Expected dims [3,2], got [{string.Join(",", newDims)}]");
+
+            // Verify data is preserved
+            using var reshapedData = reshaped.GetData<Float32Array>();
+            if (Math.Abs(reshapedData[0] - 1f) > 0.001f || Math.Abs(reshapedData[5] - 6f) > 0.001f)
+                throw new Exception("Reshape changed data values");
+
+            t8.Detail = $"[2,3] → [{string.Join(",", newDims)}], data preserved ✓";
+            await Task.CompletedTask;
+        });
+
+        // ── Test 9: Tensor Dispose ──
+        await RunTest(t9, async () =>
+        {
+            using var data = new Float32Array(new float[] { 1f, 2f });
+            var tensor = new OrtTensor("float32", data, new long[] { 2 });
+
+            var locationBefore = tensor.Location;
+            tensor.DisposeData();
+            var locationAfter = tensor.Location;
+
+            if (locationBefore != "cpu") throw new Exception($"Before dispose: expected 'cpu', got '{locationBefore}'");
+            if (locationAfter != "none") throw new Exception($"After dispose: expected 'none', got '{locationAfter}'");
+
+            t9.Detail = $"Before: {locationBefore} → After: {locationAfter} ✓";
+            tensor.Dispose();
+            await Task.CompletedTask;
+        });
+
+        // ── Test 10: Session Metadata ──
+        await RunTest(t10, async () =>
+        {
+            using var inputMeta = session!.InputMetadata;
+            using var outputMeta = session!.OutputMetadata;
+
+            if (inputMeta == null) throw new Exception("InputMetadata is null");
+            if (outputMeta == null) throw new Exception("OutputMetadata is null");
+
+            t10.Detail = $"InputMetadata: present, OutputMetadata: present ✓";
+            await Task.CompletedTask;
+        });
+
+        // ── Test 11: Run with Options ──
+        await RunTest(t11, async () =>
+        {
+            using var dataA = new Float32Array(new float[] { 10f, 20f, 30f });
+            using var dataB = new Float32Array(new float[] { 1f, 2f, 3f });
+            using var tensorA = new OrtTensor("float32", dataA, new long[] { 1, 3 });
+            using var tensorB = new OrtTensor("float32", dataB, new long[] { 1, 3 });
+
+            using var feeds = new OrtFeeds();
+            feeds.Set("A", tensorA);
+            feeds.Set("B", tensorB);
+
+            var options = new SessionRunOptions
+            {
+                LogSeverityLevel = 3,
+                Tag = "test-run-11"
+            };
+
+            using var runResult = await session!.Run(feeds, options);
+            using var output = runResult.GetTensor("C");
+            using var outData = output.GetData<Float32Array>();
+
+            float[] expected = { 11f, 22f, 33f };
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (Math.Abs(outData[i] - expected[i]) > 0.001f)
+                    throw new Exception($"Output[{i}] expected {expected[i]}, got {outData[i]}");
+            }
+
+            t11.Detail = $"Run with tag='{options.Tag}', severity={options.LogSeverityLevel} → [{string.Join(", ", expected)}] ✓";
+        });
+
+        // ── Test 12: Multiple Inferences ──
+        await RunTest(t12, async () =>
+        {
+            var allCorrect = true;
+            var runs = new[] {
+                (new float[] { 1f, 1f, 1f }, new float[] { 2f, 2f, 2f }, new float[] { 3f, 3f, 3f }),
+                (new float[] { 0f, 0f, 0f }, new float[] { 0f, 0f, 0f }, new float[] { 0f, 0f, 0f }),
+                (new float[] { -1f, 5f, 10f }, new float[] { 1f, -5f, -10f }, new float[] { 0f, 0f, 0f })
+            };
+
+            for (int r = 0; r < runs.Length; r++)
+            {
+                var (aVals, bVals, expectedVals) = runs[r];
+                using var dA = new Float32Array(aVals);
+                using var dB = new Float32Array(bVals);
+                using var tA = new OrtTensor("float32", dA, new long[] { 1, 3 });
+                using var tB = new OrtTensor("float32", dB, new long[] { 1, 3 });
+                using var f = new OrtFeeds();
+                f.Set("A", tA);
+                f.Set("B", tB);
+
+                using var res = await session!.Run(f);
+                using var outT = res.GetTensor("C");
+                using var outD = outT.GetData<Float32Array>();
+
+                for (int i = 0; i < 3; i++)
+                {
+                    if (Math.Abs(outD[i] - expectedVals[i]) > 0.001f)
+                    {
+                        allCorrect = false;
+                        throw new Exception($"Run {r + 1}: Output[{i}] expected {expectedVals[i]}, got {outD[i]}");
+                    }
+                }
+            }
+
+            t12.Detail = $"3 consecutive runs, all correct ✓";
+        });
+
+        // ── Test 13: Int32 Tensor ──
+        await RunTest(t13, async () =>
+        {
+            // Create a simple int32 add model
+            var modelBytes = BuildSimpleAddModel(elemType: 6); // 6 = INT32
+            using var jsArrayBuffer = new ArrayBuffer(modelBytes.Length);
+            using var jsView = new Uint8Array(jsArrayBuffer);
+            for (int i = 0; i < modelBytes.Length; i++)
+                jsView[i] = modelBytes[i];
+
+            using var intSession = await _ort!.CreateInferenceSessionAsync(jsArrayBuffer, new SessionCreateOptions
+            {
+                LogSeverityLevel = 2
+            });
+
+            using var dataA = new Int32Array(new int[] { 100, 200, 300 });
+            using var dataB = new Int32Array(new int[] { 10, 20, 30 });
+            using var tensorA = new OrtTensor("int32", dataA, new long[] { 1, 3 });
+            using var tensorB = new OrtTensor("int32", dataB, new long[] { 1, 3 });
+
+            using var feeds = new OrtFeeds();
+            feeds.Set("A", tensorA);
+            feeds.Set("B", tensorB);
+
+            using var intResult = await intSession.Run(feeds);
+            using var output = intResult.GetTensor("C");
+
+            if (output.Type != "int32") throw new Exception($"Expected type int32, got {output.Type}");
+
+            using var outData = output.GetData<Int32Array>();
+            int[] expected = { 110, 220, 330 };
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (outData[i] != expected[i])
+                    throw new Exception($"Int32 Output[{i}] expected {expected[i]}, got {outData[i]}");
+            }
+
+            t13.Detail = $"Type: {output.Type}, Dims: [{string.Join(",", output.Dims)}] → [{string.Join(", ", expected)}] ✓";
+            await intSession.Release();
+        });
+
+        // Cleanup
         session?.Dispose();
 
         _running = false;
@@ -216,16 +424,14 @@
     /// Build a minimal ONNX protobuf for Add(A, B) -> C
     /// ONNX is protobuf-based. This builds the binary manually.
     /// </summary>
-    static byte[] BuildSimpleAddModel()
+    /// <param name="elemType">ONNX element type: 1=FLOAT, 6=INT32, 7=INT64, etc.</param>
+    static byte[] BuildSimpleAddModel(int elemType = 1)
     {
         // This is a hand-crafted minimal ONNX protobuf for:
-        //   inputs: A (float, [1,3]), B (float, [1,3])
-        //   outputs: C (float, [1,3])
+        //   inputs: A (type, [1,3]), B (type, [1,3])
+        //   outputs: C (type, [1,3])
         //   nodes: C = Add(A, B)
         //   opset: 13
-        //
-        // Built using ONNX protobuf spec:
-        // https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
         using var ms = new System.IO.MemoryStream();
         using var w = new System.IO.BinaryWriter(ms);
 
@@ -266,7 +472,7 @@
             WriteVarint((ulong)value);
         }
 
-        // Build TensorTypeProto for float [1,3]
+        // Build TensorTypeProto for given elemType [1,3]
         byte[] BuildTensorType()
         {
             using var sub = new System.IO.MemoryStream();
@@ -277,11 +483,10 @@
             void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
             void SubWriteVarintField(int fn, long v) { SubWriteTag(fn, 0); SubWriteVarint((ulong)v); }
 
-            // elem_type = 1 (FLOAT) - field 1
-            SubWriteVarintField(1, 1);
+            // elem_type - field 1
+            SubWriteVarintField(1, elemType);
 
             // shape - field 2 (TensorShapeProto)
-            // Each dim is a Dimension with dim_value
             byte[] BuildDim(long val)
             {
                 using var ds = new System.IO.MemoryStream();
@@ -386,10 +591,6 @@
         }
 
         // Build ModelProto (the top-level message)
-        // ModelProto fields:
-        //   1: ir_version (int64)
-        //   7: graph (GraphProto)
-        //   8: opset_import (repeated OperatorSetIdProto)
         WriteVarintField(1, 7); // ir_version = 7
         WriteLenField(8, BuildOpsetImport()); // opset_import
         WriteLenField(7, BuildGraph()); // graph

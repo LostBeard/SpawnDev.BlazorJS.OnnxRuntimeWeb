@@ -72,8 +72,37 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
 
         /// <summary>
         /// Create a new tensor with the same data buffer and specified dims.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html#reshape"/>
         /// </summary>
         /// <param name="dims">New dimensions. Size should match the old one.</param>
         public OrtTensor Reshape(long[] dims) => JSRef!.Call<OrtTensor>("reshape", dims);
+
+        /// <summary>
+        /// Creates a DataURL string from tensor data.
+        /// The tensor must be of type 'uint8' with dims [1, height, width, channels] (NHWC).
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html#toDataURL"/>
+        /// </summary>
+        public string ToDataURL() => JSRef!.Call<string>("toDataURL");
+
+        /// <summary>
+        /// Creates an ImageData instance from tensor data.
+        /// The tensor must be of type 'uint8' with dims [1, height, width, channels] (NHWC).
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html#toImageData"/>
+        /// </summary>
+        public ImageData ToImageData() => JSRef!.Call<ImageData>("toImageData");
+
+        /// <summary>
+        /// Get the WebNN MLTensor that holds the tensor data.
+        /// Throws if the data is not in a WebNN MLTensor.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html#mlTensor"/>
+        /// </summary>
+        public JSObject? MlTensor => JSRef!.Get<JSObject?>("mlTensor");
+
+        /// <summary>
+        /// Get the WebGL texture that holds the tensor data.
+        /// Throws if the data is not on GPU as WebGL texture.
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html#texture"/>
+        /// </summary>
+        public JSObject? Texture => JSRef!.Get<JSObject?>("texture");
     }
 }
