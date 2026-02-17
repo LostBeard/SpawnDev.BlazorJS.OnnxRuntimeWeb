@@ -12,7 +12,18 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
     {
         /// <inheritdoc/>
         public OrtTensor(IJSInProcessObjectReference _ref) : base(_ref) { }
-
+        /// <summary>
+        /// Initializes a new instance of the OrtTensor class using the specified data type, data values, and tensor
+        /// shape.
+        /// </summary>
+        /// <remarks>Ensure that the data array length matches the total number of elements implied by the
+        /// shape. Mismatched data and shape may result in runtime errors when using the tensor in ONNX
+        /// operations.</remarks>
+        /// <param name="dataType">The data type of the tensor elements, specified as a string (for example, "float" or "int").</param>
+        /// <param name="data">A typed array containing the values to populate the tensor.</param>
+        /// <param name="shape">An array of long integers that defines the dimensions of the tensor. The product of the dimensions must
+        /// match the length of the data array.</param>
+        public OrtTensor(string dataType, TypedArray data, long[] shape) : base(JS.New($"{OnnxRuntime.GlobalModuleName}.Tensor", dataType, data, shape)) { }
         /// <summary>
         /// The dimensions of the tensor.
         /// </summary>
@@ -64,22 +75,5 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// </summary>
         /// <param name="dims">New dimensions. Size should match the old one.</param>
         public OrtTensor Reshape(long[] dims) => JSRef!.Call<OrtTensor>("reshape", dims);
-    }
-
-    /// <summary>
-    /// Options for creating a tensor from a WebGPU GPU buffer.
-    /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/TensorFromGpuBufferOptions.html"/>
-    /// </summary>
-    public class TensorFromGpuBufferOptions
-    {
-        /// <summary>
-        /// The data type of the tensor. If omitted, defaults to "float32".
-        /// </summary>
-        public string DataType { get; set; } = "float32";
-
-        /// <summary>
-        /// The dimensions of the tensor. Required.
-        /// </summary>
-        public long[] Dims { get; set; } = new long[] { 1 };
     }
 }

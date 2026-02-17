@@ -27,16 +27,22 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// </summary>
         public static string LatestCDNVersionSrc { get; } = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/ort.webgpu.bundle.min.mjs";
 
+        /// <summary>
+        /// Local static assets path prefix for WASM files bundled with this library.
+        /// Uses absolute path to prevent double-nesting when ORT resolves relative to its JS module location.
+        /// </summary>
+        public static string BundledWasmPrefix { get; } = "/_content/SpawnDev.BlazorJS.OnnxRuntimeWeb/";
+
         private static BlazorJSRuntime JS => BlazorJSRuntime.JS;
 
         /// <inheritdoc/>
         public OnnxRuntime(IJSInProcessObjectReference _ref) : base(_ref) { }
 
         /// <summary>
-        /// Initialize the ONNX Runtime Web module by loading it from CDN.
+        /// Initialize the ONNX Runtime Web module.
         /// Returns the module reference which provides access to Tensor, InferenceSession, and env.
         /// </summary>
-        /// <param name="srcUrl">Optional CDN URL override. Defaults to the latest WebGPU bundle.</param>
+        /// <param name="srcUrl">Optional URL override for the JS module. Defaults to the bundled version.</param>
         /// <returns>The loaded OnnxRuntime module.</returns>
         public static async Task<OnnxRuntime> Init(string? srcUrl = null)
         {
@@ -45,6 +51,12 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
             var ort = await JS.Import<OnnxRuntime>(GlobalModuleName, srcUrl);
             if (ort == null)
                 throw new Exception("ONNX Runtime Web could not be initialized.");
+
+            // Configure WASM paths to the bundled local static assets
+            using var env = ort.Env;
+            using var wasm = env.Wasm;
+            wasm.JSRef!.Set("wasmPaths", BundledWasmPrefix);
+
             Console.WriteLine("<< OnnxRuntime.Init");
             return ort;
         }
@@ -80,6 +92,21 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// The ORT Tensor constructor/class. Use this to access static factory methods.
         /// </summary>
         public JSObject TensorClass => JSRef!.Get<JSObject>("Tensor");
+
+        /// <summary>
+        /// Create a new ORT Tensor from typed data.
+        /// Equivalent to: new ort.Tensor(type, data, dims)
+        /// <see href="https://onnxruntime.ai/docs/api/js/interfaces/Tensor-1.html"/>
+        /// </summary>
+        /// <param name="type">Data type string (e.g., "float32", "int32", "uint8").</param>
+        /// <param name="data">A typed array (Float32Array, Int32Array, etc.) containing the tensor data.</param>
+        /// <param name="dims">The dimensions of the tensor.</param>
+        /// <returns>A new ORT Tensor.</returns>
+        public OrtTensor CreateTensor(string type, JSObject data, int[] dims)
+        {
+            using var ctor = JSRef!.Get<Function>("Tensor");
+            return Reflect.Construct<OrtTensor>(ctor, new object[] { type, data, dims });
+        }
 
         /// <summary>
         /// Create a Tensor from a WebGPU buffer. This is the key method for GPU-resident inference.

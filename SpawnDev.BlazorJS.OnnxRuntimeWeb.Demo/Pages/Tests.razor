@@ -27,7 +27,10 @@
 }
 
 @code {
-    private BlazorJSRuntime _js = BlazorJSRuntime.JS;
+
+    [Inject]
+    BlazorJSRuntime JS { get; set; } = default!;
+
     private OnnxRuntime? _ort;
     private bool _running;
     private List<TestItem> _tests = new();
@@ -122,21 +125,20 @@
             using var dataA = new Float32Array(new float[] { 1f, 2f, 3f });
             using var dataB = new Float32Array(new float[] { 4f, 5f, 6f });
 
-            // Create ORT tensors using the Tensor constructor
-            // ort.Tensor('float32', data, dims)
-            using var tensorA = _js.Call<OrtTensor>($"{OnnxRuntime.GlobalModuleName}.Tensor", "float32", dataA, new long[] { 1, 3 });
-            using var tensorB = _js.Call<OrtTensor>($"{OnnxRuntime.GlobalModuleName}.Tensor", "float32", dataB, new long[] { 1, 3 });
+            // Create ORT tensors using the OrtTensor constructor
+            using var tensorA = new OrtTensor("float32", dataA, new long[] { 1, 3 });
+            using var tensorB = new OrtTensor("float32", dataB, new long[] { 1, 3 });
 
             t4.Detail = $"Input A dims: [{string.Join(",", tensorA.Dims)}], type: {tensorA.Type}";
 
-            // Build feeds
-            using var feeds = BlazorJSRuntime.JS.New<JSObject>("Object");
+            // Build feeds using strongly-typed OrtFeeds
+            using var feeds = new OrtFeeds();
             var inputNames = session!.InputNames;
-            feeds.JSRef!.Set(inputNames[0], tensorA);
-            feeds.JSRef!.Set(inputNames[1], tensorB);
+            feeds.Set(inputNames[0], tensorA);
+            feeds.Set(inputNames[1], tensorB);
 
             // Run inference
-            result = await session.RunAsync(feeds, new SessionRunOptions { LogSeverityLevel = 2 });
+            result = await session.Run(feeds, new SessionRunOptions { LogSeverityLevel = 2 });
             t4.Detail += $" → Output received";
         });
 
