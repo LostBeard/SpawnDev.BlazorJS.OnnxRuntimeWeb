@@ -3,6 +3,7 @@
 @using global::ILGPU.Runtime
 @using SpawnDev.ILGPU
 @using SpawnDev.ILGPU.WebGPU
+@using SpawnDev.ILGPU.WebGPU.Backend
 @using System.Text.Json
 @implements IAsyncDisposable
 
@@ -11,7 +12,7 @@
 <h1 style="margin-bottom: 0.25rem;">🚀 GPU Image Preprocessing</h1>
 <p class="text-secondary" style="margin-bottom: 1.5rem;">
     Compare <strong>CPU</strong> vs <strong>GPU (ILGPU WebGPU)</strong> image preprocessing for ONNX inference.
-    Upload an image to normalize and transpose it for SqueezeNet (NCHW format, ImageNet normalization).
+    Normalize and transpose images at various resolutions to see GPU parallelism in action.
 </p>
 
 <div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start;">
@@ -41,10 +42,36 @@
             </button>
         </div>
 
+        <!-- Resolution selector -->
+        <div style="margin-bottom: 0.75rem;">
+            <label class="text-muted" style="font-size: 0.8rem; margin-right: 0.5rem;">Resolution:</label>
+            <select @bind="_selectedResolution" style="background: var(--bg-card); color: var(--text-primary); border: 1px solid var(--border-color);
+                        border-radius: var(--radius-sm); padding: 0.25rem 0.5rem; font-size: 0.85rem;">
+                @foreach (var res in _resolutions)
+                {
+                    <option value="@res">@(res)×@(res) (@(((long)res * res * 4 / 1024).ToString("N0")) KB)</option>
+                }
+            </select>
+        </div>
+
         @if (_statusMessage != null)
         {
             <p class="text-secondary" style="font-size: 0.85rem;">@_statusMessage</p>
         }
+
+        <!-- Sample Images -->
+        <div style="margin-top: 1rem;">
+            <p class="text-muted" style="font-size: 0.8rem; margin-bottom: 0.5rem;">Or try a sample:</p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                @foreach (var sample in _sampleImages)
+                {
+                    <button class="btn-outline" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;"
+                            @onclick="() => LoadSample(sample)" disabled="@(!_ready || _loading)">
+                        @sample.Name
+                    </button>
+                }
+            </div>
+        </div>
     </div>
 
     <!-- Results -->
@@ -52,7 +79,7 @@
 
         @if (_results != null)
         {
-            <h3 style="margin-bottom: 0.75rem;">Benchmark Results</h3>
+            <h3 style="margin-bottom: 0.75rem;">Benchmark Results <span class="text-muted" style="font-size: 0.85rem; font-weight: 400;">(@(_results.Resolution)×@(_results.Resolution) — @(_results.PixelCount.ToString("N0")) pixels)</span></h3>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem;">
                 <div class="card">
@@ -125,10 +152,14 @@
         double GpuPreprocessMs, double GpuInferenceMs,
         double Speedup, bool ResultsMatch,
         string? CpuTopClass, float CpuTopConfidence,
-        string? GpuTopClass, float GpuTopConfidence);
+        string? GpuTopClass, float GpuTopConfidence,
+        int Resolution, int PixelCount);
+
+    record SampleImage(string Name, string Url);
 
     private OnnxRuntime? _ort;
-    private OrtInferenceSession? _session;
+    private OrtInferenceSession? _cpuSession;   // WASM EP — for CPU tensor inference
+    private OrtInferenceSession? _gpuSession;   // WebGPU EP — for GPU-resident inference
     private Context? _ilgpuContext;
     private Accelerator? _accelerator;
     private string? _imageDataUrl;
@@ -136,6 +167,18 @@
     private bool _loading;
     private bool _ready;
     private BenchmarkResult? _results;
+    private int _selectedResolution = 1024;
+    private Action<Index1D, ArrayView<float>, ArrayView<float>, int, int>? _cachedKernel;
+
+    private static readonly int[] _resolutions = { 224, 512, 1024, 2048 };
+
+    // Local sample images — no external dependencies
+    private readonly SampleImage[] _sampleImages = new[]
+    {
+        new SampleImage("🐱 Cat", "images/cat.jpg"),
+        new SampleImage("🐕 Dog", "images/dog.jpg"),
+        new SampleImage("🚗 Car", "images/car.jpg"),
+    };
 
     // Full ImageNet 1000-class labels loaded from JSON
     private static string[]? _imagenetLabels;
@@ -146,7 +189,9 @@
 
         try
         {
-            // Init ORT
+            // Step 1: Init ORT and create WebGPU session FIRST
+            // ORT's WebGPU EP creates its own GPUDevice during session init.
+            // We'll extract that device and share it with ILGPU.
             _statusMessage = "Loading ONNX Runtime...";
             StateHasChanged();
             _ort = await OnnxRuntime.Init();
@@ -166,14 +211,50 @@
             StateHasChanged();
             using var response = await JS.Fetch("models/squeezenet/squeezenet1.0-12.onnx");
             using var arrayBuffer = await response.ArrayBuffer();
-            _session = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions { LogSeverityLevel = 3 });
 
-            // Init ILGPU WebGPU
-            _statusMessage = "Initializing ILGPU WebGPU...";
+            // Create WASM session for CPU inference (no WebGPU needed)
+            _cpuSession = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions
+            {
+                ExecutionProviders = new[] { "wasm" },
+                LogSeverityLevel = 3
+            });
+
+            // Create WebGPU session — this triggers ORT to create its own GPUDevice
+            _statusMessage = "Creating WebGPU inference session...";
+            StateHasChanged();
+            _gpuSession = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions
+            {
+                ExecutionProviders = new[] { "webgpu" },
+                LogSeverityLevel = 3
+            });
+
+            // Step 2: Extract ORT's GPUDevice (populated after WebGPU session creation)
+            _statusMessage = "Initializing ILGPU with ORT's WebGPU device...";
             StateHasChanged();
 
+            using var env = _ort.Env;
+            var ortDevice = env.GetWebGpuDevice();
+            if (ortDevice == null)
+                throw new InvalidOperationException("ORT did not create a WebGPU device. Cannot share device with ILGPU.");
+
+            // Step 3: Create ILGPU context and accelerator using ORT's GPUDevice
+            // This ensures both ILGPU and ORT use the exact same device instance,
+            // enabling zero-copy buffer sharing via Tensor.fromGpuBuffer.
             _ilgpuContext = await Context.CreateAsync(b => b.WebGPU());
-            _accelerator = await _ilgpuContext.CreatePreferredAcceleratorAsync();
+            _accelerator = WebGPUAccelerator.CreateFromExternalDevice(_ilgpuContext, ortDevice);
+
+            // Cache the kernel so it's not recompiled on every benchmark run
+            _cachedKernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, int, int>(NormalizeTransposeKernel);
+
+            // Warm-up: run a tiny GPU dispatch to fully initialize the pipeline
+            _statusMessage = "Warming up GPU pipeline...";
+            StateHasChanged();
+            using (var warmInput = _accelerator.Allocate1D<float>(16))
+            using (var warmOutput = _accelerator.Allocate1D<float>(12))
+            {
+                _cachedKernel((Index1D)4, warmInput.View, warmOutput.View, 2, 2);
+                await _accelerator.SynchronizeAsync();
+            }
 
             _statusMessage = $"Ready — ILGPU: {_accelerator.AcceleratorType}, {_accelerator.Name}";
             _ready = true;
@@ -197,6 +278,33 @@
         _imageDataUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(buffer)}";
         _results = null;
         StateHasChanged();
+
+        // Auto-run benchmark
+        await RunBenchmark();
+    }
+
+    async Task LoadSample(SampleImage sample)
+    {
+        _loading = true;
+        _statusMessage = $"Loading {sample.Name}...";
+        _results = null;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            using var response = await JS.Fetch(sample.Url);
+            using var blob = await response.Blob();
+            _imageDataUrl = URL.CreateObjectURL(blob);
+            StateHasChanged();
+            await RunBenchmark();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error loading sample: {ex.Message}";
+            _loading = false;
+            StateHasChanged();
+        }
     }
 
     // ─── ILGPU Kernel: Normalize + NHWC→NCHW transpose ───
@@ -225,60 +333,106 @@
 
     async Task RunBenchmark()
     {
-        if (_session == null || _accelerator == null || _imageDataUrl == null) return;
+        if (_cpuSession == null || _gpuSession == null || _accelerator == null || _imageDataUrl == null) return;
         _loading = true;
         StateHasChanged();
         await Task.Delay(10);
 
+        var res = _selectedResolution;
+
         try
         {
-            // Get pixel data from image using OffscreenCanvas (no DOM element needed)
-            using var canvas = new OffscreenCanvas(224, 224);
+            // Get pixel data at the selected resolution
+            _statusMessage = $"Rendering image at {res}×{res}...";
+            StateHasChanged();
+
+            using var canvas = new OffscreenCanvas(res, res);
             using var ctx = canvas.Get2DContext();
-
             using var img = await HTMLImageElement.CreateFromImageAsync(_imageDataUrl);
-
-            ctx.DrawImage(img, 0, 0, 224, 224);
-            using var imageData = ctx.GetImageData(0, 0, 224, 224);
+            ctx.DrawImage(img, 0, 0, res, res);
+            using var imageData = ctx.GetImageData(0, 0, res, res);
             using var rgbaData = imageData.Data;
-
-            // Bulk read all RGBA bytes at once instead of per-pixel indexing
             var rgbaBytes = rgbaData.ReadBytes();
 
+            int totalPixels = res * res;
+
+            // Convert bytes to floats once — shared by both CPU and GPU paths
+            var rgbaFloats = new float[rgbaBytes.Length];
+            for (int i = 0; i < rgbaBytes.Length; i++)
+                rgbaFloats[i] = rgbaBytes[i];
+
             // ─── CPU Preprocessing ───
+            _statusMessage = $"CPU preprocessing {totalPixels:N0} pixels...";
+            StateHasChanged();
+            await Task.Delay(1);
+
             var swCpu = System.Diagnostics.Stopwatch.StartNew();
-            var cpuOutput = CpuPreprocess(rgbaBytes, 224, 224);
+            var cpuOutput = CpuPreprocess(rgbaFloats, res, res);
             swCpu.Stop();
             var cpuPreprocessMs = swCpu.Elapsed.TotalMilliseconds;
 
-            // ─── GPU Preprocessing ───
+            // ─── GPU Preprocessing (stays on GPU) ───
+            _statusMessage = $"GPU preprocessing {totalPixels:N0} pixels...";
+            StateHasChanged();
+            await Task.Delay(1);
+
             var swGpu = System.Diagnostics.Stopwatch.StartNew();
-            var gpuOutput = await GpuPreprocess(rgbaBytes, 224, 224);
+            using var gpuOutputBuffer = await GpuPreprocess(rgbaFloats, res, res);
             swGpu.Stop();
             var gpuPreprocessMs = swGpu.Elapsed.TotalMilliseconds;
 
+            // ─── Inference uses 224×224 (model requirement) ───
+            // Re-render at 224×224 for actual model input
+            float[] cpuInferenceInput;
+            MemoryBuffer1D<float, Stride1D.Dense>? gpuInferenceBuffer = null;
+
+            if (res == 224)
+            {
+                cpuInferenceInput = cpuOutput;
+                // For GPU, reuse the already-computed buffer
+                gpuInferenceBuffer = gpuOutputBuffer;
+            }
+            else
+            {
+                // Re-preprocess at 224×224 for inference (model requires it)
+                using var canvas224 = new OffscreenCanvas(224, 224);
+                using var ctx224 = canvas224.Get2DContext();
+                ctx224.DrawImage(img, 0, 0, 224, 224);
+                using var imgData224 = ctx224.GetImageData(0, 0, 224, 224);
+                using var rgba224 = imgData224.Data;
+                var bytes224 = rgba224.ReadBytes();
+                var floats224 = new float[bytes224.Length];
+                for (int i = 0; i < bytes224.Length; i++) floats224[i] = bytes224[i];
+                cpuInferenceInput = CpuPreprocess(floats224, 224, 224);
+                gpuInferenceBuffer = await GpuPreprocess(floats224, 224, 224);
+            }
+
             // ─── CPU Inference ───
             var swCpuInfer = System.Diagnostics.Stopwatch.StartNew();
-            var cpuPredictions = await RunInference(cpuOutput);
+            var cpuPredictions = await RunInference(cpuInferenceInput);
             swCpuInfer.Stop();
             var cpuInferenceMs = swCpuInfer.Elapsed.TotalMilliseconds;
 
-            // ─── GPU-preprocessed Inference ───
+            // ─── GPU-resident Inference (zero-copy from ILGPU buffer) ───
             var swGpuInfer = System.Diagnostics.Stopwatch.StartNew();
-            var gpuPredictions = await RunInference(gpuOutput);
+            var gpuPredictions = await RunGpuInference(gpuInferenceBuffer!);
             swGpuInfer.Stop();
             var gpuInferenceMs = swGpuInfer.Elapsed.TotalMilliseconds;
 
+            // Clean up if we allocated a separate inference buffer
+            if (res != 224) gpuInferenceBuffer?.Dispose();
+
             // Verify results match
             bool match = cpuPredictions.topIdx == gpuPredictions.topIdx;
-            double speedup = cpuPreprocessMs > 0 ? cpuPreprocessMs / gpuPreprocessMs : 0;
+            double speedup = gpuPreprocessMs > 0 ? cpuPreprocessMs / gpuPreprocessMs : 0;
 
             _results = new BenchmarkResult(
                 cpuPreprocessMs, cpuInferenceMs,
                 gpuPreprocessMs, gpuInferenceMs,
                 speedup, match,
                 GetClassName(cpuPredictions.topIdx), cpuPredictions.topConf,
-                GetClassName(gpuPredictions.topIdx), gpuPredictions.topConf);
+                GetClassName(gpuPredictions.topIdx), gpuPredictions.topConf,
+                res, totalPixels);
         }
         catch (Exception ex)
         {
@@ -292,49 +446,37 @@
         }
     }
 
-    float[] CpuPreprocess(byte[] rgba, int width, int height)
+    float[] CpuPreprocess(float[] rgbaFloats, int width, int height)
     {
-        float[] meanR = { 0.485f }, meanG = { 0.456f }, meanB = { 0.406f };
-        float[] stdR = { 0.229f }, stdG = { 0.224f }, stdB = { 0.225f };
-
         var output = new float[3 * width * height];
         int totalPixels = width * height;
 
         for (int i = 0; i < totalPixels; i++)
         {
             int pi = i * 4;
-            output[0 * totalPixels + i] = (rgba[pi] / 255f - meanR[0]) / stdR[0];
-            output[1 * totalPixels + i] = (rgba[pi + 1] / 255f - meanG[0]) / stdG[0];
-            output[2 * totalPixels + i] = (rgba[pi + 2] / 255f - meanB[0]) / stdB[0];
+            output[0 * totalPixels + i] = (rgbaFloats[pi] / 255f - 0.485f) / 0.229f;
+            output[1 * totalPixels + i] = (rgbaFloats[pi + 1] / 255f - 0.456f) / 0.224f;
+            output[2 * totalPixels + i] = (rgbaFloats[pi + 2] / 255f - 0.406f) / 0.225f;
         }
         return output;
     }
 
-    async Task<float[]> GpuPreprocess(byte[] rgba, int width, int height)
+    async Task<MemoryBuffer1D<float, Stride1D.Dense>> GpuPreprocess(float[] rgbaFloats, int width, int height)
     {
         int totalPixels = width * height;
-
-        // Convert bytes to floats on CPU first — WebGPU WGSL doesn't support array<u8>
-        // in storage buffers (bytes get packed into 32-bit ints, corrupting individual reads)
-        var rgbaFloats = new float[rgba.Length];
-        for (int i = 0; i < rgba.Length; i++)
-            rgbaFloats[i] = rgba[i];
 
         // Upload float RGBA to GPU
         using var gpuInput = _accelerator!.Allocate1D(rgbaFloats);
 
-        // Output buffer (NCHW)
-        var emptyOutput = new float[3 * totalPixels];
-        using var gpuOutput = _accelerator.Allocate1D(emptyOutput);
+        // Output buffer (NCHW) — NOT disposed here, caller owns it
+        var gpuOutput = _accelerator.Allocate1D<float>(3 * totalPixels);
 
-        // Load and run kernel
-        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, int, int>(NormalizeTransposeKernel);
-        kernel((Index1D)totalPixels, gpuInput.View, gpuOutput.View, width, height);
+        // Run cached kernel (no recompilation)
+        _cachedKernel!((Index1D)totalPixels, gpuInput.View, gpuOutput.View, width, height);
         await _accelerator.SynchronizeAsync();
 
-        // Read back
-        var result = await gpuOutput.CopyToHostAsync<float>();
-        return result;
+        // Return the GPU buffer directly — no CPU readback!
+        return gpuOutput;
     }
 
     async Task<(int topIdx, float topConf)> RunInference(float[] preprocessed)
@@ -342,15 +484,45 @@
         using var floatData = new Float32Array(preprocessed);
         using var tensor = new OrtTensor("float32", floatData, new long[] { 1, 3, 224, 224 });
         using var feeds = new OrtFeeds();
-        feeds.Set(_session!.InputNames[0], tensor);
-        using var result = await _session.Run(feeds);
-        using var output = result.GetTensor(_session.OutputNames[0]);
+        feeds.Set(_cpuSession!.InputNames[0], tensor);
+        using var result = await _cpuSession.Run(feeds);
+        using var output = result.GetTensor(_cpuSession.OutputNames[0]);
         using var outputData = output.GetData<Float32Array>();
+        return ExtractTopPrediction(outputData.ToArray());
+    }
 
+    /// <summary>
+    /// GPU-resident inference: creates an ORT tensor directly from the ILGPU GPU buffer.
+    /// No CPU readback — data stays on the GPU the entire time.
+    /// </summary>
+    async Task<(int topIdx, float topConf)> RunGpuInference(MemoryBuffer1D<float, Stride1D.Dense> gpuBuffer)
+    {
+        // Extract the native WebGPU GPUBuffer from the ILGPU buffer
+        var iView = (IArrayView)gpuBuffer;
+        var webGpuBuffer = (WebGPUMemoryBuffer)iView.Buffer;
+        var nativeGpuBuffer = webGpuBuffer.NativeBuffer.NativeBuffer!;
+
+        // Create ORT tensor directly from the GPU buffer (zero-copy)
+        using var tensor = _ort!.TensorFromGpuBuffer(nativeGpuBuffer, new TensorFromGpuBufferOptions
+        {
+            DataType = "float32",
+            Dims = new long[] { 1, 3, 224, 224 }
+        });
+
+        using var feeds = new OrtFeeds();
+        feeds.Set(_gpuSession!.InputNames[0], tensor);
+        using var result = await _gpuSession.Run(feeds);
+        using var output = result.GetTensor(_gpuSession.OutputNames[0]);
+
+        // Output may be on GPU — use GetDataAsync to download if needed
+        using var outputData = await output.GetDataAsync<Float32Array>();
+        return ExtractTopPrediction(outputData.ToArray());
+    }
+
+    static (int topIdx, float topConf) ExtractTopPrediction(float[] probs)
+    {
         // SqueezeNet 1.0 output "softmaxout_1" is already softmaxed —
-        // values are probabilities (0..1), NOT raw logits. No need for additional softmax.
-        var probs = outputData.ToArray();
-
+        // values are probabilities (0..1), NOT raw logits.
         int topIdx = 0;
         float topVal = 0;
         for (int i = 0; i < probs.Length; i++)
@@ -370,7 +542,8 @@
 
     public async ValueTask DisposeAsync()
     {
-        _session?.Dispose();
+        _cpuSession?.Dispose();
+        _gpuSession?.Dispose();
         _ort?.Dispose();
         _accelerator?.Dispose();
         _ilgpuContext?.Dispose();
