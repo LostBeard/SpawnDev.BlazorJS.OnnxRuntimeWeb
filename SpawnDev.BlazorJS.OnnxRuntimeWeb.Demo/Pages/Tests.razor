@@ -1,0 +1,402 @@
+@page "/tests"
+@implements IDisposable
+
+<PageTitle>ORT Tests</PageTitle>
+
+<h1>ONNX Runtime Web — Tests</h1>
+
+<div style="margin-bottom: 1rem;">
+    <button class="btn btn-primary" @onclick="RunAllTests" disabled="@_running">
+        @(_running ? "Running..." : "Run All Tests")
+    </button>
+</div>
+
+@foreach (var test in _tests)
+{
+    <div style="padding: 8px 12px; margin: 4px 0; border-radius: 4px;
+                background: @(test.Status == TestStatus.Pass ? "#d4edda" :
+                              test.Status == TestStatus.Fail ? "#f8d7da" :
+                              test.Status == TestStatus.Running ? "#fff3cd" : "#e9ecef");
+                color: #333; font-family: monospace; font-size: 14px;">
+        <strong>@StatusIcon(test.Status)</strong> @test.Name
+        @if (!string.IsNullOrEmpty(test.Detail))
+        {
+            <br /><span style="margin-left: 28px; font-size: 12px; color: #555;">@test.Detail</span>
+        }
+    </div>
+}
+
+@code {
+    private BlazorJSRuntime _js = BlazorJSRuntime.JS;
+    private OnnxRuntime? _ort;
+    private bool _running;
+    private List<TestItem> _tests = new();
+
+    enum TestStatus { Pending, Running, Pass, Fail }
+
+    class TestItem
+    {
+        public string Name { get; set; } = "";
+        public TestStatus Status { get; set; } = TestStatus.Pending;
+        public string? Detail { get; set; }
+    }
+
+    string StatusIcon(TestStatus s) => s switch
+    {
+        TestStatus.Pass => "✅",
+        TestStatus.Fail => "❌",
+        TestStatus.Running => "⏳",
+        _ => "⬜"
+    };
+
+    async Task RunAllTests()
+    {
+        _running = true;
+        _tests.Clear();
+
+        // Define tests
+        var t1 = AddTest("1. Module Load");
+        var t2 = AddTest("2. Environment Configuration");
+        var t3 = AddTest("3. Session Create (simple add model)");
+        var t4 = AddTest("4. Tensor Create + Inference");
+        var t5 = AddTest("5. Output Verification");
+
+        StateHasChanged();
+        await Task.Delay(50);
+
+        // ── Test 1: Load ORT module ──
+        await RunTest(t1, async () =>
+        {
+            _ort = await OnnxRuntime.Init();
+            t1.Detail = $"Module loaded. Tensor class exists: {_ort.TensorClass != null}";
+        });
+
+        if (_ort == null) { _running = false; StateHasChanged(); return; }
+
+        // ── Test 2: Environment ──
+        await RunTest(t2, async () =>
+        {
+            using var env = _ort!.Env;
+            env.LogSeverityLevel = 2;
+            var level = env.LogSeverityLevel;
+            if (level != 2) throw new Exception($"LogSeverityLevel expected 2, got {level}");
+            t2.Detail = $"LogSeverityLevel set to {level}. Env accessible.";
+            await Task.CompletedTask;
+        });
+
+        // ── Test 3: Create session from a tiny ONNX model ──
+        // We'll create a simple model inline — an Add model with 2 float inputs
+        // Using ORT's public test model: a small model that adds two tensors
+        OrtInferenceSession? session = null;
+        await RunTest(t3, async () =>
+        {
+            // Create a simple "add" model using ONNX format
+            // Using a minimal ONNX protobuf for an Add(A, B) -> C model
+            var modelBytes = BuildSimpleAddModel();
+            using var jsArrayBuffer = new ArrayBuffer(modelBytes.Length);
+            using var jsView = new Uint8Array(jsArrayBuffer);
+            for (int i = 0; i < modelBytes.Length; i++)
+                jsView[i] = modelBytes[i];
+
+            session = await _ort!.CreateInferenceSessionAsync(jsArrayBuffer, new SessionCreateOptions
+            {
+                LogSeverityLevel = 2
+            });
+
+            var inputNames = session.InputNames;
+            var outputNames = session.OutputNames;
+            t3.Detail = $"Inputs: [{string.Join(", ", inputNames)}], Outputs: [{string.Join(", ", outputNames)}]";
+
+            if (inputNames.Length != 2) throw new Exception($"Expected 2 inputs, got {inputNames.Length}");
+            if (outputNames.Length != 1) throw new Exception($"Expected 1 output, got {outputNames.Length}");
+        });
+
+        if (session == null) { _running = false; StateHasChanged(); return; }
+
+        // ── Test 4: Create tensors and run inference ──
+        OrtSessionResult? result = null;
+        await RunTest(t4, async () =>
+        {
+            // Create two input tensors: A = [1, 2, 3], B = [4, 5, 6]
+            // Expected output C = [5, 7, 9]
+            using var dataA = new Float32Array(new float[] { 1f, 2f, 3f });
+            using var dataB = new Float32Array(new float[] { 4f, 5f, 6f });
+
+            // Create ORT tensors using the Tensor constructor
+            // ort.Tensor('float32', data, dims)
+            using var tensorA = _js.Call<OrtTensor>($"{OnnxRuntime.GlobalModuleName}.Tensor", "float32", dataA, new long[] { 1, 3 });
+            using var tensorB = _js.Call<OrtTensor>($"{OnnxRuntime.GlobalModuleName}.Tensor", "float32", dataB, new long[] { 1, 3 });
+
+            t4.Detail = $"Input A dims: [{string.Join(",", tensorA.Dims)}], type: {tensorA.Type}";
+
+            // Build feeds
+            using var feeds = BlazorJSRuntime.JS.New<JSObject>("Object");
+            var inputNames = session!.InputNames;
+            feeds.JSRef!.Set(inputNames[0], tensorA);
+            feeds.JSRef!.Set(inputNames[1], tensorB);
+
+            // Run inference
+            result = await session.RunAsync(feeds, new SessionRunOptions { LogSeverityLevel = 2 });
+            t4.Detail += $" → Output received";
+        });
+
+        if (result == null) { _running = false; StateHasChanged(); return; }
+
+        // ── Test 5: Verify output values ──
+        await RunTest(t5, async () =>
+        {
+            var outputName = session!.OutputNames[0];
+            using var outputTensor = result!.GetTensor(outputName);
+
+            var dims = outputTensor.Dims;
+            var type = outputTensor.Type;
+            var location = outputTensor.Location;
+
+            t5.Detail = $"Dims: [{string.Join(",", dims)}], Type: {type}, Location: {location}";
+
+            // Read output data
+            using var outputData = outputTensor.GetData<Float32Array>();
+            var values = new float[outputData.Length];
+            for (int i = 0; i < outputData.Length; i++)
+                values[i] = outputData[i];
+
+            // Verify: 1+4=5, 2+5=7, 3+6=9
+            float[] expected = { 5f, 7f, 9f };
+            for (int i = 0; i < expected.Length; i++)
+            {
+                if (Math.Abs(values[i] - expected[i]) > 0.001f)
+                    throw new Exception($"Output[{i}] expected {expected[i]}, got {values[i]}");
+            }
+
+            t5.Detail += $" → Values: [{string.Join(", ", values)}] ✓";
+
+            await Task.CompletedTask;
+        });
+
+        // Cleanup
+        result?.Dispose();
+        session?.Dispose();
+
+        _running = false;
+        StateHasChanged();
+    }
+
+    TestItem AddTest(string name)
+    {
+        var t = new TestItem { Name = name };
+        _tests.Add(t);
+        return t;
+    }
+
+    async Task RunTest(TestItem test, Func<Task> action)
+    {
+        test.Status = TestStatus.Running;
+        StateHasChanged();
+        await Task.Delay(20);
+
+        try
+        {
+            await action();
+            test.Status = TestStatus.Pass;
+        }
+        catch (Exception ex)
+        {
+            test.Status = TestStatus.Fail;
+            test.Detail = ex.Message;
+            Console.WriteLine($"TEST FAIL [{test.Name}]: {ex}");
+        }
+
+        StateHasChanged();
+        await Task.Delay(20);
+    }
+
+    /// <summary>
+    /// Build a minimal ONNX protobuf for Add(A, B) -> C
+    /// ONNX is protobuf-based. This builds the binary manually.
+    /// </summary>
+    static byte[] BuildSimpleAddModel()
+    {
+        // This is a hand-crafted minimal ONNX protobuf for:
+        //   inputs: A (float, [1,3]), B (float, [1,3])
+        //   outputs: C (float, [1,3])
+        //   nodes: C = Add(A, B)
+        //   opset: 13
+        //
+        // Built using ONNX protobuf spec:
+        // https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
+        using var ms = new System.IO.MemoryStream();
+        using var w = new System.IO.BinaryWriter(ms);
+
+        // Helper to write protobuf varint
+        void WriteVarint(ulong value)
+        {
+            while (value >= 0x80)
+            {
+                w.Write((byte)(value | 0x80));
+                value >>= 7;
+            }
+            w.Write((byte)value);
+        }
+
+        // Helper to write a protobuf field tag
+        void WriteTag(int fieldNumber, int wireType)
+        {
+            WriteVarint((ulong)((fieldNumber << 3) | wireType));
+        }
+
+        // Helper to write length-delimited field
+        void WriteLenField(int fieldNumber, byte[] data)
+        {
+            WriteTag(fieldNumber, 2); // wire type 2 = length-delimited
+            WriteVarint((ulong)data.Length);
+            w.Write(data);
+        }
+
+        void WriteStringField(int fieldNumber, string s)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(s);
+            WriteLenField(fieldNumber, bytes);
+        }
+
+        void WriteVarintField(int fieldNumber, long value)
+        {
+            WriteTag(fieldNumber, 0); // wire type 0 = varint
+            WriteVarint((ulong)value);
+        }
+
+        // Build TensorTypeProto for float [1,3]
+        byte[] BuildTensorType()
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+            void SubWriteVarintField(int fn, long v) { SubWriteTag(fn, 0); SubWriteVarint((ulong)v); }
+
+            // elem_type = 1 (FLOAT) - field 1
+            SubWriteVarintField(1, 1);
+
+            // shape - field 2 (TensorShapeProto)
+            // Each dim is a Dimension with dim_value
+            byte[] BuildDim(long val)
+            {
+                using var ds = new System.IO.MemoryStream();
+                using var dw = new System.IO.BinaryWriter(ds);
+                void DWriteVarint(ulong v2) { while (v2 >= 0x80) { dw.Write((byte)(v2 | 0x80)); v2 >>= 7; } dw.Write((byte)v2); }
+                void DWriteTag(int fn, int wt) { DWriteVarint((ulong)((fn << 3) | wt)); }
+                void DWriteVarintField(int fn, long v2) { DWriteTag(fn, 0); DWriteVarint((ulong)v2); }
+                DWriteVarintField(1, val); // dim_value = field 1
+                return ds.ToArray();
+            }
+
+            byte[] BuildShape()
+            {
+                using var ss = new System.IO.MemoryStream();
+                using var ssw = new System.IO.BinaryWriter(ss);
+                void SWriteVarint(ulong v3) { while (v3 >= 0x80) { ssw.Write((byte)(v3 | 0x80)); v3 >>= 7; } ssw.Write((byte)v3); }
+                void SWriteTag(int fn, int wt) { SWriteVarint((ulong)((fn << 3) | wt)); }
+                void SWriteLenField(int fn, byte[] d) { SWriteTag(fn, 2); SWriteVarint((ulong)d.Length); ssw.Write(d); }
+                var dim1 = BuildDim(1);
+                var dim3 = BuildDim(3);
+                SWriteLenField(1, dim1); // dim - field 1 (repeated)
+                SWriteLenField(1, dim3);
+                return ss.ToArray();
+            }
+
+            SubWriteLenField(2, BuildShape());
+            return sub.ToArray();
+        }
+
+        // Build TypeProto containing tensor_type
+        byte[] BuildTypeProto()
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+            SubWriteLenField(1, BuildTensorType()); // tensor_type = field 1
+            return sub.ToArray();
+        }
+
+        // Build ValueInfoProto
+        byte[] BuildValueInfo(string name)
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+            var nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+            SubWriteLenField(1, nameBytes); // name = field 1
+            SubWriteLenField(2, BuildTypeProto()); // type = field 2
+            return sub.ToArray();
+        }
+
+        // Build NodeProto for Add
+        byte[] BuildAddNode()
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+            SubWriteLenField(1, System.Text.Encoding.UTF8.GetBytes("A")); // input - field 1 (repeated)
+            SubWriteLenField(1, System.Text.Encoding.UTF8.GetBytes("B")); // input
+            SubWriteLenField(2, System.Text.Encoding.UTF8.GetBytes("C")); // output - field 2 (repeated)
+            SubWriteLenField(3, System.Text.Encoding.UTF8.GetBytes("add_node")); // name - field 3
+            SubWriteLenField(4, System.Text.Encoding.UTF8.GetBytes("Add")); // op_type - field 4
+            return sub.ToArray();
+        }
+
+        // Build GraphProto
+        byte[] BuildGraph()
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+
+            SubWriteLenField(1, BuildAddNode()); // node - field 1 (repeated)
+            SubWriteLenField(2, System.Text.Encoding.UTF8.GetBytes("test_graph")); // name - field 2
+            SubWriteLenField(11, BuildValueInfo("A")); // input - field 11 (repeated)
+            SubWriteLenField(11, BuildValueInfo("B")); // input
+            SubWriteLenField(12, BuildValueInfo("C")); // output - field 12 (repeated)
+
+            return sub.ToArray();
+        }
+
+        // Build OperatorSetIdProto
+        byte[] BuildOpsetImport()
+        {
+            using var sub = new System.IO.MemoryStream();
+            using var sw = new System.IO.BinaryWriter(sub);
+            void SubWriteVarint(ulong v) { while (v >= 0x80) { sw.Write((byte)(v | 0x80)); v >>= 7; } sw.Write((byte)v); }
+            void SubWriteTag(int fn, int wt) { SubWriteVarint((ulong)((fn << 3) | wt)); }
+            void SubWriteLenField(int fn, byte[] d) { SubWriteTag(fn, 2); SubWriteVarint((ulong)d.Length); sw.Write(d); }
+            void SubWriteVarintField(int fn, long v) { SubWriteTag(fn, 0); SubWriteVarint((ulong)v); }
+            SubWriteLenField(1, System.Text.Encoding.UTF8.GetBytes("")); // domain - field 1
+            SubWriteVarintField(2, 13); // version = 13 - field 2
+            return sub.ToArray();
+        }
+
+        // Build ModelProto (the top-level message)
+        // ModelProto fields:
+        //   1: ir_version (int64)
+        //   7: graph (GraphProto)
+        //   8: opset_import (repeated OperatorSetIdProto)
+        WriteVarintField(1, 7); // ir_version = 7
+        WriteLenField(8, BuildOpsetImport()); // opset_import
+        WriteLenField(7, BuildGraph()); // graph
+
+        return ms.ToArray();
+    }
+
+    public void Dispose()
+    {
+        _ort?.Dispose();
+    }
+}

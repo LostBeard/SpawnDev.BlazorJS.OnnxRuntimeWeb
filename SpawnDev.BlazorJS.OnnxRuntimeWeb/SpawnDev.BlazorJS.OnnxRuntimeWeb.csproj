@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+	<PropertyGroup>
+		<TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Version>1.0.0-rc.1</Version>
+		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<EmbedAllSources>true</EmbedAllSources>
+		<DebugType>Embedded</DebugType>
+		<Title>SpawnDev.BlazorJS.OnnxRuntimeWeb</Title>
+		<Authors>LostBeard</Authors>
+		<Description>Use ONNX Runtime Web from Blazor WebAssembly for GPU-accelerated machine learning inference with WebGPU support.</Description>
+		<PackageTags>Blazor;BlazorWebAssembly;Javascript;ONNX;OnnxRuntime;WebGPU;MachineLearning;Inference</PackageTags>
+		<PackageProjectUrl>https://github.com/LostBeard/SpawnDev.BlazorJS.OnnxRuntimeWeb</PackageProjectUrl>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+		<PackageIcon>icon-128.png</PackageIcon>
+		<RepositoryUrl>https://github.com/LostBeard/SpawnDev.BlazorJS.OnnxRuntimeWeb.git</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="Assets\icon-128.png" Pack="true" PackagePath="\" />
+		<None Include="..\LICENSE.txt" Pack="true" PackagePath="\" />
+		<None Include="..\README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SpawnDev.BlazorJS" Version="3.0.3" />
+	</ItemGroup>
+	
+	<ItemGroup>
+		<SupportedPlatform Include="browser" />
+	</ItemGroup>
+
+	<PropertyGroup>
+		<!-- Disable filename mangling with hash which is enabled by default in .Net 10 SDK. It causes runtime loading of Javascript files to fail due to unknown filename. -->
+		<StaticWebAssetFingerprintingEnabled>false</StaticWebAssetFingerprintingEnabled>
+		<StaticWebAssetsFingerprintContent>false</StaticWebAssetsFingerprintContent>
+	</PropertyGroup>
+	
+</Project>
