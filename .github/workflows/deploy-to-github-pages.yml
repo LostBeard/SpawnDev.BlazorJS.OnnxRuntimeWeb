@@ -25,11 +25,11 @@ jobs:
 
     # publishes Blazor project to the publish-folder
     - name: Publish .NET Core Project
-      run: dotnet publish ./SpawnDev.BlaazorJS.OnnxRuntimeWeb.Demo/ --nologo -c:Release --output publish
+      run: dotnet publish ./SpawnDev.BlazorJS.OnnxRuntimeWeb.Demo/ --nologo -c:Release --output publish
 
-    # changes the base-tag in index.html from '/' to '/SpawnDev.BlaazorJS.OnnxRuntimeWeb/' to match GitHub Pages repository subdirectory
-    - name: Change base-tag in index.html from / to /SpawnDev.BlaazorJS.OnnxRuntimeWeb/
-      run: sed -i 's/<base href="\/"/<base href="\/SpawnDev.BlaazorJS.OnnxRuntimeWeb\/"/g' publish/wwwroot/index.html
+    # changes the base-tag in index.html from '/' to '/SpawnDev.BlazorJS.OnnxRuntimeWeb/' to match GitHub Pages repository subdirectory
+    - name: Change base-tag in index.html from / to /SpawnDev.BlazorJS.OnnxRuntimeWeb/
+      run: sed -i 's/<base href="\/"/<base href="\/SpawnDev.BlazorJS.OnnxRuntimeWeb\/"/g' publish/wwwroot/index.html
     
     # copy index.html to 404.html to serve the same file when a file is not found
     - name: copy index.html to 404.html
