@@ -56,6 +56,17 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         }
 
         /// <summary>
+        /// Gets the WebGPU device currently used by ONNX Runtime.
+        /// After creating a session with the "webgpu" execution provider,
+        /// ORT populates this property with its internal GPUDevice.
+        /// Returns null if no WebGPU device has been initialized.
+        /// </summary>
+        public GPUDevice? GetWebGpuDevice()
+        {
+            return JSRef!.Get<JSObject>("webgpu").JSRef!.Get<GPUDevice?>("device");
+        }
+
+        /// <summary>
         /// Set the preferred output location for WebGPU sessions.
         /// </summary>
         /// <param name="location">"cpu" | "gpu-buffer" | "ml-tensor"</param>

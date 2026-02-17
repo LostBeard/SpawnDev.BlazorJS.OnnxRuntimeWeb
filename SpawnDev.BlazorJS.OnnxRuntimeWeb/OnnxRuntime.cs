@@ -18,14 +18,14 @@ namespace SpawnDev.BlazorJS.OnnxRuntimeWeb
         /// <summary>
         /// ONNX Runtime Web (WebGPU) bundled with this library.<br/>
         /// Downloaded from:<br/>
-        /// https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/ort.webgpu.bundle.min.mjs
+        /// https://cdn.jsdelivr.net/npm/onnxruntime-web@1.25.0-dev.20260213-bd8f781f2c/dist/ort.webgpu.bundle.min.mjs
         /// </summary>
-        public static string LatestBundledVersionSrc { get; } = "./_content/SpawnDev.BlazorJS.OnnxRuntimeWeb/ort-web-1.24.1.webgpu.bundle.min.mjs";
+        public static string LatestBundledVersionSrc { get; } = "./_content/SpawnDev.BlazorJS.OnnxRuntimeWeb/ort-web-1.25.0-dev.webgpu.bundle.min.mjs";
 
         /// <summary>
         /// ONNX Runtime Web CDN URL (WebGPU bundle).
         /// </summary>
-        public static string LatestCDNVersionSrc { get; } = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.1/dist/ort.webgpu.bundle.min.mjs";
+        public static string LatestCDNVersionSrc { get; } = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.25.0-dev.20260213-bd8f781f2c/dist/ort.webgpu.bundle.min.mjs";
 
         /// <summary>
         /// Local static assets content path suffix for WASM files bundled with this library.
