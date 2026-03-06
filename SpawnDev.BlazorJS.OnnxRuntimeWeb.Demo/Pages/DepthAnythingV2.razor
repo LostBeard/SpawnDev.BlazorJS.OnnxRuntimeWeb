@@ -1,0 +1,661 @@
+@page "/depth-estimation"
+@using global::ILGPU
+@using global::ILGPU.Runtime
+@using SpawnDev.ILGPU
+@using SpawnDev.ILGPU.WebGPU
+@using SpawnDev.ILGPU.WebGPU.Backend
+@implements IAsyncDisposable
+
+<PageTitle>DepthAnythingV2 — GPU Depth Estimation</PageTitle>
+
+<h1 style="margin-bottom: 0.25rem;">🌊 Depth Anything V2</h1>
+<p class="text-secondary" style="margin-bottom: 1.5rem;">
+    GPU-resident depth estimation: <strong>ORT</strong> creates the GPUDevice → <strong>ILGPU</strong> wraps it via
+    <code>CreateFromExternalDevice</code>. Preprocessing, inference, and postprocessing all share one device — zero CPU copies.
+</p>
+
+<div style="display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start;">
+
+    <!-- Controls -->
+    <div style="min-width: 280px;">
+
+        <div style="position: relative; width: 260px; height: 260px; background: var(--bg-card); border: 1px solid var(--border-color);
+                    border-radius: var(--radius-lg); display: flex; align-items: center; justify-content: center; overflow: hidden; margin-bottom: 0.75rem;">
+            @if (_imageDataUrl != null)
+            {
+                <img src="@_imageDataUrl" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+            }
+            else
+            {
+                <span class="text-muted" style="font-size: 0.9rem;">No image selected</span>
+            }
+        </div>
+
+        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem;">
+            <label class="btn btn-primary" style="cursor: pointer; margin: 0;">
+                Upload Image
+                <InputFile OnChange="OnFileSelected" accept="image/*" style="display: none;" />
+            </label>
+            <button class="btn-outline" @onclick="RunDepthEstimation" disabled="@(_loading || _imageDataUrl == null || !_ready)">
+                @(_loading ? "Running..." : "Run Depth")
+            </button>
+        </div>
+
+        @if (_statusMessage != null)
+        {
+            <p class="text-secondary" style="font-size: 0.85rem;">@_statusMessage</p>
+        }
+
+        <!-- Sample Images -->
+        <div style="margin-top: 1rem;">
+            <p class="text-muted" style="font-size: 0.8rem; margin-bottom: 0.5rem;">Or try a sample:</p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                @foreach (var sample in _sampleImages)
+                {
+                    <button class="btn-outline" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;"
+                            @onclick="() => LoadSample(sample)" disabled="@(!_ready || _loading)">
+                        @sample.Name
+                    </button>
+                }
+            </div>
+        </div>
+
+        <!-- Device sharing status -->
+        @if (_deviceStatus != null)
+        {
+            <div class="card" style="margin-top: 1rem; font-size: 0.8rem; border-color: @(_deviceMatch ? "rgba(63,185,80,0.3)" : "rgba(248,81,73,0.3)");">
+                <div style="font-weight: 600; margin-bottom: 0.25rem;">
+                    @(_deviceMatch ? "✅ Device Sharing" : "❌ Device Mismatch")
+                </div>
+                <div class="text-muted" style="white-space: pre-wrap;">@_deviceStatus</div>
+            </div>
+        }
+    </div>
+
+    <!-- Results -->
+    <div style="min-width: 350px; flex: 1;">
+        @if (_depthDataUrl != null)
+        {
+            <h3 style="margin-bottom: 0.75rem;">Depth Result
+                <span class="text-muted" style="font-size: 0.85rem; font-weight: 400;">
+                    (@(_resultW)×@(_resultH) — @_timingInfo)
+                </span>
+            </h3>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+                <div>
+                    <div class="text-muted" style="font-size: 0.8rem; margin-bottom: 0.25rem;">Input</div>
+                    <img src="@_imageDataUrl" style="width: 100%; border-radius: var(--radius-sm);" />
+                </div>
+                <div>
+                    <div class="text-muted" style="font-size: 0.8rem; margin-bottom: 0.25rem;">Depth Map</div>
+                    <img src="@_depthDataUrl" style="width: 100%; border-radius: var(--radius-sm);" />
+                </div>
+            </div>
+
+            @if (_timingDetails != null)
+            {
+                <div class="card" style="font-size: 0.85rem;">
+                    <div class="card-header">⏱ Timing Breakdown</div>
+                    <div style="display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem;">
+                        @foreach (var (label, ms) in _timingDetails)
+                        {
+                            <span class="text-muted">@label</span>
+                            <span style="font-weight: 600;">@($"{ms:F1}") ms</span>
+                        }
+                    </div>
+                </div>
+            }
+        }
+        else if (!_ready)
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">@(_statusMessage ?? "Initializing...")</p>
+            </div>
+        }
+        else
+        {
+            <div class="card" style="text-align: center; padding: 2rem;">
+                <p class="text-secondary">Upload an image and click Run Depth</p>
+            </div>
+        }
+    </div>
+
+</div>
+
+
+@code {
+    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+
+    record SampleImage(string Name, string Url);
+
+    // ── Model config ──
+    private const int ModelInputW = 518;
+    private const int ModelInputH = 518;
+    private const string ModelUrl = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model_quantized.onnx";
+
+    // ImageNet normalization (same as DepthAnything uses)
+    private static readonly float[] ImageMean = { 0.485f, 0.456f, 0.406f };
+    private static readonly float[] ImageStd = { 0.229f, 0.224f, 0.225f };
+
+    // ── ORT + ILGPU resources ──
+    private OnnxRuntime? _ort;
+    private OrtInferenceSession? _session;
+    private Context? _ilgpuContext;
+    private Accelerator? _accelerator;
+
+    // ── ILGPU kernels ──
+    private Action<Index1D, ArrayView<float>, ArrayView<float>, int, int, int, int,
+        float, float, float, float, float, float>? _preprocessKernel;
+    private Action<Index1D, ArrayView<float>, ArrayView<uint>, float, float>? _colormapKernel;
+    // output: [minBits, maxBits] as int (bit-reinterpreted floats for atomic ops)
+    private Action<Index1D, ArrayView<float>, ArrayView<int>>? _minMaxKernel;
+
+    // ── UI state ──
+    private string? _imageDataUrl;
+    private string? _depthDataUrl;
+    private string? _statusMessage;
+    private string? _deviceStatus;
+    private bool _deviceMatch;
+    private bool _loading;
+    private bool _ready;
+    private int _resultW, _resultH;
+    private string? _timingInfo;
+    private List<(string Label, double Ms)>? _timingDetails;
+
+    private readonly SampleImage[] _sampleImages = new[]
+    {
+        new SampleImage("🐱 Cat", "images/cat.jpg"),
+        new SampleImage("🐕 Dog", "images/dog.jpg"),
+        new SampleImage("🚗 Car", "images/car.jpg"),
+    };
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        try
+        {
+            // ═══ Step 1: Init ORT ═══
+            _statusMessage = "Loading ONNX Runtime...";
+            StateHasChanged();
+            _ort = await OnnxRuntime.Init();
+
+            // ═══ Step 2: Download DepthAnythingV2 and create WebGPU session ═══
+            _statusMessage = "Downloading DepthAnythingV2 model (~18 MB)...";
+            StateHasChanged();
+
+            using var response = await JS.Fetch(ModelUrl);
+            using var arrayBuffer = await response.ArrayBuffer();
+
+            _statusMessage = "Creating WebGPU inference session...";
+            StateHasChanged();
+
+            _session = await _ort.CreateInferenceSessionAsync(arrayBuffer, new SessionCreateOptions
+            {
+                ExecutionProviders = new[] { "webgpu" },
+                LogSeverityLevel = 3
+            });
+
+            Console.WriteLine($"[DepthV2] Session created. Inputs: [{string.Join(", ", _session.InputNames)}], Outputs: [{string.Join(", ", _session.OutputNames)}]");
+
+            // ═══ Step 3: Extract ORT's GPUDevice ═══
+            _statusMessage = "Extracting ORT's GPUDevice...";
+            StateHasChanged();
+
+            using var env = _ort.Env;
+            var ortDevice = env.GetWebGpuDevice();
+            if (ortDevice == null)
+                throw new InvalidOperationException("ORT did not create a WebGPU device.");
+
+            // ═══ Step 4: Create ILGPU accelerator from ORT's device ═══
+            _statusMessage = "Creating ILGPU accelerator from ORT's device...";
+            StateHasChanged();
+
+            _ilgpuContext = await Context.CreateAsync(b => b.WebGPU());
+            _accelerator = WebGPUAccelerator.CreateFromExternalDevice(_ilgpuContext, ortDevice);
+
+            Console.WriteLine($"[DepthV2] ILGPU accelerator: {_accelerator.Name}");
+
+            // ═══ Step 5: Verify device identity ═══
+            var ilgpuDevice = ((WebGPUAccelerator)_accelerator).NativeAccelerator.NativeDevice;
+            bool sameDevice = ilgpuDevice != null && ortDevice.JSRef!.Equals(ilgpuDevice!.JSRef);
+            _deviceMatch = sameDevice;
+            _deviceStatus = sameDevice
+                ? $"ORT and ILGPU share the same GPUDevice instance.\nAccelerator: {_accelerator.Name}"
+                : "WARNING: ORT and ILGPU are using DIFFERENT devices!\nBuffer sharing will fail.";
+
+            Console.WriteLine($"[DepthV2] Device sharing: {(sameDevice ? "SAME ✓" : "DIFFERENT ✗")}");
+
+            // ═══ Step 6: Compile ILGPU kernels ═══
+            _statusMessage = "Compiling GPU kernels...";
+            StateHasChanged();
+
+            _preprocessKernel = _accelerator.LoadAutoGroupedStreamKernel<
+                Index1D, ArrayView<float>, ArrayView<float>, int, int, int, int,
+                float, float, float, float, float, float>(PreprocessKernel);
+            Console.WriteLine("[DepthV2] PreprocessKernel compiled OK");
+
+            _colormapKernel = _accelerator.LoadAutoGroupedStreamKernel<
+                Index1D, ArrayView<float>, ArrayView<uint>, float, float>(ColormapKernel);
+            Console.WriteLine("[DepthV2] ColormapKernel compiled OK");
+
+            _minMaxKernel = _accelerator.LoadAutoGroupedStreamKernel<
+                Index1D, ArrayView<float>, ArrayView<int>>(FloatMinMaxKernel);
+            Console.WriteLine("[DepthV2] FloatMinMaxKernel compiled OK");
+
+            _statusMessage = $"Ready — {_accelerator.Name}";
+            _ready = true;
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Init error: {ex.Message}";
+            Console.WriteLine($"[DepthV2] Init error: {ex}");
+        }
+
+        StateHasChanged();
+    }
+
+
+    // ══════════════════════════════════════════════════════════════
+    //  ILGPU Kernels
+    // ══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// GPU kernel: bilinear resize + normalize + NHWC→NCHW transpose.
+    /// Input:  float RGBA buffer (srcW × srcH × 4)
+    /// Output: float NCHW buffer (3 × dstH × dstW), normalized with given mean/std.
+    /// </summary>
+    static void PreprocessKernel(
+        Index1D index,
+        ArrayView<float> src,       // srcW*srcH*4 floats (RGBA)
+        ArrayView<float> dst,       // 3*dstH*dstW floats (NCHW)
+        int srcW, int srcH,
+        int dstW, int dstH,
+        float meanR, float meanG, float meanB,
+        float invStdR, float invStdG, float invStdB)
+    {
+        int totalPixels = dstW * dstH;
+        if (index >= totalPixels) return;
+
+        int dy = index / dstW;
+        int dx = index % dstW;
+
+        // Bilinear sample from source
+        float sx = (dx + 0.5f) * srcW / (float)dstW - 0.5f;
+        float sy = (dy + 0.5f) * srcH / (float)dstH - 0.5f;
+
+        int x0 = (int)sx;
+        int y0 = (int)sy;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+        if (x1 >= srcW) x1 = srcW - 1;
+        if (y1 >= srcH) y1 = srcH - 1;
+
+        float fx = sx - x0;
+        float fy = sy - y0;
+        if (fx < 0) fx = 0;
+        if (fy < 0) fy = 0;
+
+        int i00 = (y0 * srcW + x0) * 4;
+        int i10 = (y0 * srcW + x1) * 4;
+        int i01 = (y1 * srcW + x0) * 4;
+        int i11 = (y1 * srcW + x1) * 4;
+
+        float w00 = (1 - fx) * (1 - fy);
+        float w10 = fx * (1 - fy);
+        float w01 = (1 - fx) * fy;
+        float w11 = fx * fy;
+
+        float r = (src[i00] * w00 + src[i10] * w10 + src[i01] * w01 + src[i11] * w11) / 255f;
+        float g = (src[i00 + 1] * w00 + src[i10 + 1] * w10 + src[i01 + 1] * w01 + src[i11 + 1] * w11) / 255f;
+        float b = (src[i00 + 2] * w00 + src[i10 + 2] * w10 + src[i01 + 2] * w01 + src[i11 + 2] * w11) / 255f;
+
+        // Normalize and write NCHW
+        dst[0 * totalPixels + index] = (r - meanR) * invStdR;
+        dst[1 * totalPixels + index] = (g - meanG) * invStdG;
+        dst[2 * totalPixels + index] = (b - meanB) * invStdB;
+    }
+
+    /// <summary>
+    /// GPU kernel: normalize depth values and apply an inferno-style colormap.
+    /// Input:  float depth buffer (raw model output)
+    /// Output: uint RGBA buffer (0xAABBGGRR packed, alpha=0xFF)
+    /// Params: minVal, invRange — precomputed from a CPU min/max pass over the depth data.
+    /// </summary>
+    static void ColormapKernel(
+        Index1D index,
+        ArrayView<float> depth,
+        ArrayView<uint> output,
+        float minVal,
+        float invRange)
+    {
+        if (index >= depth.Length) return;
+
+        float raw = (depth[index] - minVal) * invRange;
+        // clamp to [0,1]
+        float t = raw < 0f ? 0f : (raw > 1f ? 1f : raw);
+
+        // Three-segment inferno colormap (branchless — avoids Math.Clamp which throws)
+        float s0t = t * 3.030303f;
+        float s0 = s0t < 0f ? 0f : (s0t > 1f ? 1f : s0t);
+        float s1t = (t - 0.33f) * 3.030303f;
+        float s1 = s1t < 0f ? 0f : (s1t > 1f ? 1f : s1t);
+        float s2t = (t - 0.66f) * 2.941176f;
+        float s2 = s2t < 0f ? 0f : (s2t > 1f ? 1f : s2t);
+
+        float r0 = 0.05f + s0 * 0.35f;
+        float r1 = 0.4f  + s1 * 0.5f;
+        float r2 = 0.9f  + s2 * 0.1f;
+        float g0 = 0.0f  + s0 * 0.1f;
+        float g1 = 0.1f  + s1 * 0.3f;
+        float g2 = 0.4f  + s2 * 0.55f;
+        float b0 = 0.2f  + s0 * 0.4f;
+        float b1 = 0.6f  - s1 * 0.3f;
+        float b2 = 0.3f  - s2 * 0.15f;
+
+        float r = r0 + s1 * (r1 - r0) + s2 * (r2 - r1);
+        float g = g0 + s1 * (g1 - g0) + s2 * (g2 - g1);
+        float b = b0 + s1 * (b1 - b0) + s2 * (b2 - b1);
+
+        uint ri = (uint)(r * 255f);
+        uint gi = (uint)(g * 255f);
+        uint bi = (uint)(b * 255f);
+        output[index] = ri | (gi << 8) | (bi << 16) | 0xFF000000u;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  Image Loading
+    // ══════════════════════════════════════════════════════════════
+
+    async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        var buffer = new byte[file.Size];
+        await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).ReadExactlyAsync(buffer);
+        _imageDataUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(buffer)}";
+        _depthDataUrl = null;
+        _timingDetails = null;
+        StateHasChanged();
+
+        await RunDepthEstimation();
+    }
+
+    async Task LoadSample(SampleImage sample)
+    {
+        _loading = true;
+        _statusMessage = $"Loading {sample.Name}...";
+        _depthDataUrl = null;
+        _timingDetails = null;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            using var response = await JS.Fetch(sample.Url);
+            using var blob = await response.Blob();
+            _imageDataUrl = URL.CreateObjectURL(blob);
+            StateHasChanged();
+            await RunDepthEstimation();
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error loading sample: {ex.Message}";
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  Depth Estimation — Fully GPU-Resident Pipeline
+    // ══════════════════════════════════════════════════════════════
+
+    async Task RunDepthEstimation()
+    {
+        if (_session == null || _accelerator == null || _imageDataUrl == null || _ort == null) return;
+        _loading = true;
+        StateHasChanged();
+        await Task.Delay(10);
+
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // ── Step 1: Load image pixels (CPU → GPU upload, one-time) ──
+            _statusMessage = "Reading image pixels...";
+            StateHasChanged();
+
+            using var img = await HTMLImageElement.CreateFromImageAsync(_imageDataUrl);
+            int imgW = img.NaturalWidth;
+            int imgH = img.NaturalHeight;
+
+            using var canvas = new OffscreenCanvas(imgW, imgH);
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(img, 0, 0, imgW, imgH);
+            using var imageData = ctx.GetImageData(0, 0, imgW, imgH);
+            using var rgbaData = imageData.Data;
+            var rgbaBytes = rgbaData.ReadBytes();
+
+            // Convert to float for WGSL storage buffer compatibility
+            var rgbaFloats = new float[rgbaBytes.Length];
+            for (int i = 0; i < rgbaBytes.Length; i++)
+                rgbaFloats[i] = rgbaBytes[i];
+
+            float loadMs = (float)sw.Elapsed.TotalMilliseconds;
+
+            // ── Step 2: GPU Preprocessing (resize + normalize + NCHW) ──
+            _statusMessage = "GPU preprocessing...";
+            StateHasChanged();
+            sw.Restart();
+
+            int totalModelPixels = ModelInputW * ModelInputH;
+
+            using var gpuInput = _accelerator.Allocate1D(rgbaFloats);
+            using var gpuPreprocessed = _accelerator.Allocate1D<float>(3 * totalModelPixels);
+
+            float invStdR = 1f / ImageStd[0];
+            float invStdG = 1f / ImageStd[1];
+            float invStdB = 1f / ImageStd[2];
+
+            _preprocessKernel!(
+                (Index1D)totalModelPixels,
+                gpuInput.View, gpuPreprocessed.View,
+                imgW, imgH, ModelInputW, ModelInputH,
+                ImageMean[0], ImageMean[1], ImageMean[2],
+                invStdR, invStdG, invStdB);
+            await _accelerator.SynchronizeAsync();
+
+            float preprocessMs = (float)sw.Elapsed.TotalMilliseconds;
+
+            // ── Step 3: Create ORT tensor from ILGPU GPU buffer (zero-copy) ──
+            _statusMessage = "Running inference (GPU-resident)...";
+            StateHasChanged();
+            sw.Restart();
+
+            var iView = (IArrayView)gpuPreprocessed;
+            var webGpuBuffer = (WebGPUMemoryBuffer)iView.Buffer;
+            var nativeGpuBuffer = webGpuBuffer.NativeBuffer.NativeBuffer!;
+
+            using var ortInputTensor = _ort.TensorFromGpuBuffer(nativeGpuBuffer, new TensorFromGpuBufferOptions
+            {
+                DataType = "float32",
+                Dims = new long[] { 1, 3, ModelInputH, ModelInputW }
+            });
+
+            // ── Step 4: ORT inference — output stays on GPU ──
+            using var feeds = new OrtFeeds();
+            feeds.Set(_session.InputNames[0], ortInputTensor);
+
+            using var outputs = await _session.Run(feeds, new SessionRunOptions
+            {
+                PreferredOutputLocation = "gpu-buffer",
+                LogSeverityLevel = 3
+            });
+
+            float inferenceMs = (float)sw.Elapsed.TotalMilliseconds;
+
+            // ── Step 5: Extract output depth tensor (GPU-resident) ──
+            sw.Restart();
+
+            OrtTensor? outputTensor = null;
+            foreach (var name in _session.OutputNames)
+            {
+                outputTensor = outputs.TryGetTensor(name);
+                if (outputTensor != null) break;
+            }
+
+            if (outputTensor == null)
+            {
+                _statusMessage = "Error: No output tensor from inference.";
+                return;
+            }
+
+            using (outputTensor)
+            {
+                var dims = outputTensor.Dims;
+                var location = outputTensor.Location;
+                Console.WriteLine($"[DepthV2] Output: location={location}, dims=[{string.Join(",", dims)}]");
+
+                int outH = (int)dims[dims.Length - 2];
+                int outW = (int)dims[dims.Length - 1];
+                int outLen = outW * outH;
+
+                // ── Step 6: Wrap ORT's output GPUBuffer as an ILGPU ArrayView (zero-copy) ──
+                // WrapExternalBuffer creates a non-owning view over ORT's buffer so the
+                // colormap kernel can read it directly — no GPU-to-GPU copy needed.
+                if (location != "gpu-buffer")
+                {
+                    Console.WriteLine($"[DepthV2] WARNING: Output on '{location}', expected 'gpu-buffer'. Falling back to CPU upload.");
+                }
+
+                var webGpuAcc = (WebGPUAccelerator)_accelerator!;
+                using var srcGpuBuf = location == "gpu-buffer" ? outputTensor.GPUBuffer : null;
+
+                // Allocate colormap output buffer
+                using var colorBuffer = _accelerator.Allocate1D<uint>(outLen);
+
+                // ── Step 7: GPU min/max reduction (CPU readback only for 2 floats) ──
+                _statusMessage = "GPU postprocessing...";
+                StateHasChanged();
+
+                float minVal, maxVal, invRange;
+
+                if (srcGpuBuf != null)
+                {
+                    // Wrap ORT's buffer as a non-owning ILGPU view — zero GPU-to-GPU copy
+                    var (depthView, externalBuf) = webGpuAcc.WrapExternalBuffer<float>(srcGpuBuf, outLen);
+                    using (externalBuf)
+                    {
+                        // ── Step 7: GPU min/max reduction — fully on GPU, no CPU readback of depth data ──
+                        // Seed: [MaxValue, MinValue] so first atomic wins
+                        using var minMaxBuf = _accelerator.Allocate1D<int>(2);
+                        minMaxBuf.CopyFromCPU(new int[] { int.MaxValue, int.MinValue });
+                        _minMaxKernel!((Index1D)outLen, depthView, minMaxBuf.View);
+                        await _accelerator.SynchronizeAsync();
+
+                        // Tiny readback: only 8 bytes (2 ints) cross the GPU→CPU boundary
+                        var minMaxHost = await minMaxBuf.CopyToHostAsync<int>();
+                        minVal = Interop.IntAsFloat((uint)minMaxHost[0]);
+                        maxVal = Interop.IntAsFloat((uint)minMaxHost[1]);
+                        float range = maxVal - minVal;
+                        invRange = range > 0 ? 1f / range : 0f;
+
+                        // ── Step 8: GPU colormap (ILGPU kernel reads ORT buffer directly) ──
+                        _colormapKernel!((Index1D)outLen, depthView, colorBuffer.View, minVal, invRange);
+                        await _accelerator.SynchronizeAsync();
+                        Console.WriteLine($"[DepthV2] Zero-copy colormap: {outLen} floats, min={minVal:F4}, max={maxVal:F4}");
+                    }
+                }
+                else
+                {
+                    // Fallback: ORT output was not on GPU — allocate ILGPU buffer and upload
+                    using var depthF32 = outputTensor.GetData<Float32Array>();
+                    var depthData = depthF32.ToArray();
+                    using var depthBuffer = _accelerator.Allocate1D(depthData);
+
+                    // GPU min/max reduction via atomic bit-reinterpretation
+                    using var minMaxBuf = _accelerator.Allocate1D<int>(2);
+                    minMaxBuf.CopyFromCPU(new int[] { int.MaxValue, int.MinValue });
+                    _minMaxKernel!((Index1D)outLen, depthBuffer.View, minMaxBuf.View);
+                    await _accelerator.SynchronizeAsync();
+
+                    var minMaxHost = await minMaxBuf.CopyToHostAsync<int>();
+                    minVal = Interop.IntAsFloat((uint)minMaxHost[0]);
+                    maxVal = Interop.IntAsFloat((uint)minMaxHost[1]);
+                    float range = maxVal - minVal;
+                    invRange = range > 0 ? 1f / range : 0f;
+
+                    _colormapKernel!((Index1D)outLen, depthBuffer.View, colorBuffer.View, minVal, invRange);
+                    await _accelerator.SynchronizeAsync();
+                }
+
+                float postprocessMs = (float)sw.Elapsed.TotalMilliseconds;
+
+                // ── Step 9: Read back colorized result for display ──
+                sw.Restart();
+
+                var colorData = await colorBuffer.CopyToHostAsync<uint>();
+
+                using var destCanvas = new OffscreenCanvas(outW, outH);
+                using var destCtx = destCanvas.Get2DContext();
+                using var outImgData = destCtx.CreateImageData(outW, outH);
+                using var outPixels = outImgData.Data;
+
+                var byteData = new byte[outLen * 4];
+                for (int i = 0; i < outLen; i++)
+                {
+                    uint px = colorData[i];
+                    byteData[i * 4]     = (byte)(px & 0xFF);
+                    byteData[i * 4 + 1] = (byte)((px >> 8) & 0xFF);
+                    byteData[i * 4 + 2] = (byte)((px >> 16) & 0xFF);
+                    byteData[i * 4 + 3] = (byte)((px >> 24) & 0xFF);
+                }
+                outPixels.Set(byteData);
+                destCtx.PutImageData(outImgData, 0, 0);
+
+                using var blob = await destCanvas.ConvertToBlob();
+                _depthDataUrl = URL.CreateObjectURL(blob);
+
+                float readbackMs = (float)sw.Elapsed.TotalMilliseconds;
+
+                // Results
+                _resultW = outW;
+                _resultH = outH;
+                float totalMs = loadMs + preprocessMs + inferenceMs + postprocessMs + readbackMs;
+                _timingInfo = $"{totalMs:F0} ms total";
+                _timingDetails = new()
+                {
+                    ("Image Load", loadMs),
+                    ("GPU Preprocess", preprocessMs),
+                    ("ORT Inference", inferenceMs),
+                    ("GPU Postprocess", postprocessMs),
+                    ("Display Readback", readbackMs),
+                    ("Total", totalMs),
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Error: {ex.Message}";
+            Console.WriteLine($"[DepthV2] Error: {ex}");
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+
+        _session?.Dispose();
+        _ort?.Dispose();
+        _accelerator?.Dispose();
+        _ilgpuContext?.Dispose();
+    }
+}
