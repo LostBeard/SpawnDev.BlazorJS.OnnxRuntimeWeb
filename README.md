@@ -12,7 +12,7 @@ This library provides full C# bindings for [ONNX Runtime Web](https://onnxruntim
 - 🔗 **Zero-Copy Buffer Sharing** — Share GPU buffers directly between ONNX Runtime and other WebGPU libraries (e.g., ILGPU)
 - 💪 **Strongly-Typed C# API** — Full IntelliSense support with comprehensive XML documentation
 - 🎯 **Built on SpawnDev.BlazorJS** — Synchronous JavaScript interop for natural C# usage
-- 📦 **Bundled Runtime** — Includes ONNX Runtime Web 1.24.1 with WebGPU bundle
+- 📦 **Bundled Runtime** — Includes ONNX Runtime Web 1.25.0-dev with WebGPU + WASM SIMD backends
 - 🌐 **Multi-Framework Support** — Targets .NET 8, 9, and 10
 
 ## Installation
